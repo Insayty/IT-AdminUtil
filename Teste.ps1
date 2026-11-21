@@ -8,18 +8,17 @@
 #>
 
 # ==============================================================================
-# 1. AUTO-ELEVAÇÃO UAC (COMPATÍVEL COM ARQUIVO LOCAL E EXECUÇÃO EM MEMÓRIA IEX)
+# 1. AUTO-ELEVAÇÃO UAC (MÉTODO WINUTIL PARA IRM | IEX E ARQUIVO LOCAL)
 # ==============================================================================
+$ScriptUrl = "https://raw.githubusercontent.com/Insayty/IT-AdminUtil/main/Teste.ps1"
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
 if (-not $isAdmin) {
     if ($PSCommandPath -and (Test-Path $PSCommandPath)) {
         Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"" -Verb RunAs
     } else {
-        # Se executado via irm | iex, materializa temporariamente para elevar
-        $tempScript = "$env:TEMP\ITAdminUtil_Elevated.ps1"
-        $MyInvocation.MyCommand.ScriptContents | Out-File -FilePath $tempScript -Encoding UTF8 -Force
-        Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -Command `"& '$tempScript'; Remove-Item '$tempScript' -Force`"" -Verb RunAs
+        $cmd = "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; irm '$ScriptUrl' | iex"
+        Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -Command `"$cmd`"" -Verb RunAs
     }
     exit
 }
