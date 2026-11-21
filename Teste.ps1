@@ -3,8 +3,8 @@
     IT-AdminUtil - Console Portatil de Administracao de TI (Estilo WinUtil)
 .DESCRIPTION
     Utilitario completo em PowerShell + WPF com Dashboard Avancado (Telemetria,
-    Sensores Termicos CPU/NVMe, Controle Rapido de Interfaces de Rede/DHCP/IP Fixo),
-    Console Ocultavel e Popup com Abas para Relatorios.
+    Sensores Termicos CPU/NVMe, Perfis Rapidos de IP/VLAN, Controle de Servicos,
+    Ping Gateway/WAN, Copiar Ficha Tecnica), Console Ocultavel e Popup com Abas.
 #>
 
 # ==============================================================================
@@ -27,8 +27,42 @@ Add-Type -AssemblyName PresentationCore
 Add-Type -AssemblyName WindowsBase
 Add-Type -AssemblyName System.Windows.Forms
 
+$ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+$ProfilesFile = Join-Path $ScriptDir "ip_profiles.json"
+
 # ==============================================================================
-# 2. ESTADO SINCRONIZADO ENTRE UI E RUNSPACES (THREAD-SAFE)
+# 2. GERENCIAMENTO DE PERFIS DE IP / VLAN (PERSISTENCIA EM JSON)
+# ==============================================================================
+function global:Get-IpProfiles {
+    if (Test-Path $ProfilesFile) {
+        try {
+            $data = Get-Content -Path $ProfilesFile -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($data) { return @($data) }
+        } catch {}
+    }
+
+    # Perfis padrao iniciais (editaveis pela interface)
+    $defaults = @(
+        [PSCustomObject]@{ Name = "Bancada / Roteador Padrao (.1.50)"; IP = "192.168.1.50"; Mask = "255.255.255.0"; Gateway = "192.168.1.1"; DNS = "8.8.8.8" },
+        [PSCustomObject]@{ Name = "Rede Equipamentos (.0.50)"; IP = "192.168.0.50"; Mask = "255.255.255.0"; Gateway = "192.168.0.1"; DNS = "8.8.8.8" },
+        [PSCustomObject]@{ Name = "Gerencia Switches / OLT (10.101.1.250)"; IP = "10.101.1.250"; Mask = "255.255.255.0"; Gateway = "10.101.1.1"; DNS = "1.1.1.1" },
+        [PSCustomObject]@{ Name = "UniFi / Controladora (.20.50)"; IP = "192.168.20.50"; Mask = "255.255.255.0"; Gateway = "192.168.20.254"; DNS = "192.168.20.254" }
+    )
+    Save-IpProfiles -Profiles $defaults
+    return $defaults
+}
+
+function global:Save-IpProfiles {
+    param([array]$Profiles)
+    try {
+        $Profiles | ConvertTo-Json -Depth 3 | Out-File -FilePath $ProfilesFile -Encoding UTF8
+    } catch {
+        Write-AppLog "Nao foi possivel salvar ip_profiles.json (executando em modo somente leitura)." "WARN"
+    }
+}
+
+# ==============================================================================
+# 3. ESTADO SINCRONIZADO ENTRE UI E RUNSPACES (THREAD-SAFE)
 # ==============================================================================
 $SyncHash = [hashtable]::Synchronized(@{
     LogQueue        = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
@@ -57,7 +91,7 @@ function global:Write-AppLog {
 }
 
 # ==============================================================================
-# 3. MOTOR DE EXECUCAO ASSINCRONA
+# 4. MOTOR DE EXECUCAO ASSINCRONA
 # ==============================================================================
 function global:Invoke-AsyncTask {
     param(
@@ -153,12 +187,10 @@ function global:Invoke-AsyncTask {
             }
         }
 
-        # Funcao robusta para voltar qualquer placa de rede para DHCP (mesmo desconectada)
         function global:Enable-AdapterDhcpClean {
             param([string]$Alias)
             Write-TaskLog "Removendo IP estatico e habilitando DHCP em '$Alias'..." "CMD"
 
-            # 1. Remove IPs estaticos e rotas residuais via NetTCPIP
             Get-NetIPAddress -InterfaceAlias $Alias -AddressFamily IPv4 -ErrorAction SilentlyContinue |
                 Where-Object { $_.PrefixOrigin -eq 'Manual' } |
                 Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
@@ -167,17 +199,36 @@ function global:Invoke-AsyncTask {
                 Where-Object { $_.Protocol -eq 'NetMgmt' } |
                 Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
 
-            # 2. Habilita DHCP na interface e reseta DNS
             Set-NetIPInterface -InterfaceAlias $Alias -Dhcp Enabled -ErrorAction SilentlyContinue
             Set-DnsClientServerAddress -InterfaceAlias $Alias -ResetServerAddresses -ErrorAction SilentlyContinue
 
-            # 3. Reforca via netsh e renova concessao se estiver conectada
             Invoke-NativeCmd "netsh interface ipv4 set address name=`"$Alias`" source=dhcp"
             Invoke-NativeCmd "netsh interface ipv4 set dnsservers name=`"$Alias`" source=dhcp"
 
             $nicState = (Get-NetAdapter -Name $Alias -ErrorAction SilentlyContinue).Status
             if ($nicState -eq "Up") {
                 Invoke-NativeCmd "ipconfig /renew `"$Alias`""
+            }
+        }
+
+        function global:Set-AdapterStaticClean {
+            param(
+                [string]$Alias,
+                [string]$IP,
+                [string]$Mask = "255.255.255.0",
+                [string]$Gateway = "",
+                [string]$DNS = ""
+            )
+            Write-TaskLog "Aplicando IP fixo $IP ($Mask) em '$Alias'..." "CMD"
+            if ($Gateway) {
+                Invoke-NativeCmd "netsh interface ipv4 set address name=`"$Alias`" static $IP $Mask $Gateway 1"
+            } else {
+                Invoke-NativeCmd "netsh interface ipv4 set address name=`"$Alias`" static $IP $Mask"
+            }
+            if ($DNS) {
+                Invoke-NativeCmd "netsh interface ipv4 set dnsservers name=`"$Alias`" static $DNS primary"
+            } else {
+                Invoke-NativeCmd "netsh interface ipv4 set dnsservers name=`"$Alias`" source=dhcp"
             }
         }
 
@@ -189,7 +240,7 @@ function global:Invoke-AsyncTask {
                 $Sync.ShowResults = $true
             }
             if ($DoRefreshDash) {
-                Start-Sleep -Milliseconds 700
+                Start-Sleep -Milliseconds 650
                 $Sync.RefreshDashNext = $true
             }
         } catch {
@@ -206,11 +257,11 @@ function global:Invoke-AsyncTask {
 }
 
 # ==============================================================================
-# 4. COLETA ASSINCRONA DO DASHBOARD (COM PLACAS DE REDE, SENSORES E TELEMETRIA)
+# 5. COLETA ASSINCRONA DO DASHBOARD (TELEMETRIA, LATENCIA, REDES E SERVICOS)
 # ==============================================================================
 function global:Update-DashboardAsync {
-    $SyncHash.StatusText = "Coletando telemetria e interfaces de rede..."
-    Write-AppLog "Atualizando telemetria, sensores termicos e interfaces de rede..." "CMD"
+    $SyncHash.StatusText = "Atualizando telemetria e interfaces..."
+    Write-AppLog "Atualizando telemetria, latencia e interfaces de rede..." "CMD"
 
     $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
     $rs = [runspacefactory]::CreateRunspace($iss)
@@ -228,6 +279,8 @@ function global:Update-DashboardAsync {
         Import-Module Storage -ErrorAction SilentlyContinue
         Import-Module NetTCPIP -ErrorAction SilentlyContinue
         Import-Module DnsClient -ErrorAction SilentlyContinue
+
+        $deg = [char]176
 
         try {
             $cs    = Get-CimInstance Win32_ComputerSystem
@@ -254,7 +307,7 @@ function global:Update-DashboardAsync {
                     }
                 } catch {}
             }
-            $cpuTempStr = if ($cpuTempC) { "$cpuTempC °C" } else { "N/D" }
+            $cpuTempStr = if ($cpuTempC) { "$cpuTempC ${deg}C" } else { "N/D" }
 
             # --- 2. RAM E SLOTS FISICOS ---
             $totalRamGB = [math]::Round($cs.TotalPhysicalMemory / 1GB, 1)
@@ -284,7 +337,7 @@ function global:Update-DashboardAsync {
                 foreach ($pd in $physDisks) {
                     $rel = $pd | Get-StorageReliabilityCounter -ErrorAction SilentlyContinue
                     $gb = [math]::Round($pd.Size / 1GB, 0)
-                    $tempTxt = if ($rel.Temperature -and $rel.Temperature -gt 0) { "$($rel.Temperature)°C" } else { "--°C" }
+                    $tempTxt = if ($rel.Temperature -and $rel.Temperature -gt 0) { "$($rel.Temperature)${deg}C" } else { "--${deg}C" }
                     $wearTxt = if ($null -ne $rel.Wear) { "Saude: $(100 - $rel.Wear)%" } else { $pd.HealthStatus }
                     $hrsTxt  = if ($rel.PowerOnHours) { " | $($rel.PowerOnHours)h" } else { "" }
                     $smartLines += "$($pd.FriendlyName) [${gb}GB] -> $tempTxt | $wearTxt$hrsTxt"
@@ -315,7 +368,7 @@ function global:Update-DashboardAsync {
                 }
             }
 
-            # --- 5. TODAS AS PLACAS DE REDE FISICAS (DETECCAO VIA NETTCPIP PARA PRECISAO MESMO DESCONECTADA) ---
+            # --- 5. PLACAS DE REDE FISICAS ---
             $nicList = @()
             $adapters = Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
                         Where-Object { $_.InterfaceDescription -notmatch "Bluetooth|Virtual|Hyper-V|TAP|VPN|Tailscale|ZeroTier" }
@@ -355,12 +408,35 @@ function global:Update-DashboardAsync {
             }
 
             $activeNic = $nicList | Where-Object { $_.Connected } | Select-Object -First 1
-            $ipAddr = if ($activeNic) { $activeNic.IPv4 } else { "Sem rede" }
-            $gwAddr = if ($activeNic -and $activeNic.Gateway) { $activeNic.Gateway } else { "N/D" }
+            $ipAddr  = if ($activeNic) { $activeNic.IPv4 } else { "Sem rede" }
+            $gwAddr  = if ($activeNic -and $activeNic.Gateway) { $activeNic.Gateway } else { "" }
             $dnsAddr = if ($activeNic -and $activeNic.Dns) { $activeNic.Dns } else { "N/D" }
-            $netOnline = Test-Connection 8.8.8.8 -Count 1 -Quiet
 
-            # --- 6. UPTIME & ESTABILIDADE ---
+            # --- 6. MEDICAO DE LATENCIA (GATEWAY LOCAL + INTERNET) ---
+            $pinger = New-Object System.Net.NetworkInformation.Ping
+            $gwLatency = "--"
+            if ($gwAddr) {
+                try {
+                    $rGw = $pinger.Send($gwAddr, 800)
+                    if ($rGw.Status -eq "Success") {
+                        $ms = if ($rGw.RoundtripTime -eq 0) { "<1" } else { "$($rGw.RoundtripTime)" }
+                        $gwLatency = "${ms} ms"
+                    } else { $gwLatency = "Falha" }
+                } catch { $gwLatency = "Falha" }
+            }
+
+            $netOnline = $false
+            $wanLatency = "--"
+            try {
+                $rWan = $pinger.Send("1.1.1.1", 1200)
+                if ($rWan.Status -eq "Success") {
+                    $netOnline = $true
+                    $wanLatency = "$($rWan.RoundtripTime) ms"
+                }
+            } catch {}
+            $pinger.Dispose()
+
+            # --- 7. UPTIME & ESTABILIDADE ---
             $up = (Get-Date) - $os.LastBootUpTime
             $uptimeStr = "$($up.Days)d $($up.Hours)h $($up.Minutes)m"
 
@@ -375,7 +451,7 @@ function global:Update-DashboardAsync {
                 }
             } catch {}
 
-            # --- 7. SERVICOS & SEGURANCA ---
+            # --- 8. SERVICOS & SEGURANCA ---
             $spooler  = (Get-Service Spooler -ErrorAction SilentlyContinue).Status -eq "Running"
             $wuauserv = (Get-Service wuauserv -ErrorAction SilentlyContinue).Status -eq "Running"
             $defender = (Get-Service WinDefend -ErrorAction SilentlyContinue).Status -eq "Running"
@@ -422,16 +498,18 @@ function global:Update-DashboardAsync {
                 BitLocker    = $bitlockerStatus
                 TopProcs     = $topProcs
                 IpAddress    = $ipAddr
-                Gateway      = $gwAddr
+                Gateway      = if ($gwAddr) { $gwAddr } else { "N/D" }
                 Dns          = $dnsAddr
                 InternetOk   = $netOnline
+                GwLatency    = $gwLatency
+                WanLatency   = $wanLatency
                 SvcSpooler   = $spooler
                 SvcWU        = $wuauserv
                 SvcDefender  = $defender
                 SvcRdp       = $rdpEnabled
             }
             $Sync.DashboardReady = $true
-            $Sync.LogQueue.Enqueue("[" + (Get-Date).ToString("HH:mm:ss") + "] [OK] Telemetria e placas de rede atualizadas.")
+            $Sync.LogQueue.Enqueue("[" + (Get-Date).ToString("HH:mm:ss") + "] [OK] Dashboard atualizado (GW: $gwLatency | Internet: $wanLatency).")
         } catch {
             $Sync.ErrorCount++
             $Sync.LogQueue.Enqueue("[" + (Get-Date).ToString("HH:mm:ss") + "] [ERRO] Falha ao carregar Dashboard: $($_.Exception.Message)")
@@ -445,7 +523,7 @@ function global:Update-DashboardAsync {
 }
 
 # ==============================================================================
-# 5. JANELA POPUP COM ABAS PARA EXIBICAO DOS RESULTADOS
+# 6. POPUP DE RESULTADOS E GERENCIADOR DE PERFIS DE IP
 # ==============================================================================
 function Show-ResultsPopup {
     param([System.Collections.ArrayList]$TabsData)
@@ -587,9 +665,119 @@ function Show-ResultsPopup {
     [void]$resWin.ShowDialog()
 }
 
-# ==============================================================================
-# 6. HELPER PARA CONFIGURAR IP / DHCP DE UMA PLACA ESPECIFICA
-# ==============================================================================
+function global:Open-ManageIpProfilesDialog {
+    $dlg = New-Object System.Windows.Window
+    $dlg.Title = "Gerenciar Perfis Rapidos de IP / VLAN"
+    $dlg.Width = 540
+    $dlg.Height = 440
+    $dlg.WindowStartupLocation = "CenterOwner"
+    $dlg.Owner = $Window
+    $dlg.Background = "#1E222A"
+    $dlg.Foreground = "#E5E7EB"
+    $dlg.ResizeMode = "NoResize"
+
+    $grid = New-Object System.Windows.Controls.Grid
+    $grid.Margin = "16"
+    $r1 = New-Object System.Windows.Controls.RowDefinition; $r1.Height = "Auto"
+    $r2 = New-Object System.Windows.Controls.RowDefinition; $r2.Height = "*"
+    $r3 = New-Object System.Windows.Controls.RowDefinition; $r3.Height = "Auto"
+    [void]$grid.RowDefinitions.Add($r1)
+    [void]$grid.RowDefinitions.Add($r2)
+    [void]$grid.RowDefinitions.Add($r3)
+
+    $lblTop = New-Object System.Windows.Controls.TextBlock
+    $lblTop.Text = "Seus Perfis Salvos (arquivo: ip_profiles.json)"
+    $lblTop.FontWeight = "Bold"
+    $lblTop.Foreground = "#3B82F6"
+    $lblTop.FontSize = 14
+    $lblTop.Margin = "0,0,0,10"
+    [System.Windows.Controls.Grid]::SetRow($lblTop, 0)
+    [void]$grid.Children.Add($lblTop)
+
+    $listBox = New-Object System.Windows.Controls.ListBox
+    $listBox.Background = "#161920"
+    $listBox.Foreground = "#E5E7EB"
+    $listBox.BorderBrush = "#3E4451"
+    $listBox.FontFamily = "Consolas"
+    $listBox.FontSize = 12
+    [System.Windows.Controls.Grid]::SetRow($listBox, 1)
+    [void]$grid.Children.Add($listBox)
+
+    $script:CurrentProfiles = [System.Collections.ArrayList]@(Get-IpProfiles)
+
+    $refreshList = {
+        $listBox.Items.Clear()
+        foreach ($p in $script:CurrentProfiles) {
+            [void]$listBox.Items.Add("$($p.Name)  -->  $($p.IP) / $($p.Mask) (GW: $($p.Gateway))")
+        }
+    }
+    & $refreshList
+
+    $btnRow = New-Object System.Windows.Controls.StackPanel
+    $btnRow.Orientation = "Horizontal"
+    $btnRow.HorizontalAlignment = "Right"
+    $btnRow.Margin = "0,12,0,0"
+    [System.Windows.Controls.Grid]::SetRow($btnRow, 2)
+
+    $btnAdd = New-Object System.Windows.Controls.Button
+    $btnAdd.Content = "+ Novo Perfil"
+    $btnAdd.Padding = "12,6"
+    $btnAdd.Margin = "0,0,8,0"
+    $btnAdd.Background = "#2B579A"
+    $btnAdd.Foreground = "#FFFFFF"
+    $btnAdd.FontWeight = "Bold"
+    $btnAdd.Add_Click({
+        $newP = Show-InputDialog -Title "Adicionar Novo Perfil de IP" -Fields @(
+            @{Name="Name"; Label="Nome do Perfil (ex: VLAN Cameras 10.20):"; Type="Text"},
+            @{Name="IP"; Label="Endereco IPv4:"; Type="Text"},
+            @{Name="Mask"; Label="Mascara de Sub-rede:"; Type="Text"; Default="255.255.255.0"},
+            @{Name="Gateway"; Label="Gateway Padrao (Opcional):"; Type="Text"},
+            @{Name="DNS"; Label="DNS Primaria (Opcional):"; Type="Text"; Default="8.8.8.8"}
+        )
+        if ($newP -and $newP.Name -and $newP.IP) {
+            [void]$script:CurrentProfiles.Add([PSCustomObject]@{
+                Name    = $newP.Name
+                IP      = $newP.IP
+                Mask    = if ($newP.Mask) { $newP.Mask } else { "255.255.255.0" }
+                Gateway = $newP.Gateway
+                DNS     = $newP.DNS
+            })
+            Save-IpProfiles -Profiles @($script:CurrentProfiles)
+            & $refreshList
+            Write-AppLog "Perfil '$($newP.Name)' salvo." "OK"
+        }
+    })
+
+    $btnDel = New-Object System.Windows.Controls.Button
+    $btnDel.Content = "Remover Selecionado"
+    $btnDel.Padding = "12,6"
+    $btnDel.Margin = "0,0,8,0"
+    $btnDel.Background = "#282C34"
+    $btnDel.Foreground = "#FCA5A5"
+    $btnDel.Add_Click({
+        if ($listBox.SelectedIndex -ge 0) {
+            $script:CurrentProfiles.RemoveAt($listBox.SelectedIndex)
+            Save-IpProfiles -Profiles @($script:CurrentProfiles)
+            & $refreshList
+        }
+    })
+
+    $btnClose = New-Object System.Windows.Controls.Button
+    $btnClose.Content = "Concluir"
+    $btnClose.Padding = "14,6"
+    $btnClose.Background = "#282C34"
+    $btnClose.Foreground = "#FFFFFF"
+    $btnClose.Add_Click({ $dlg.Close() })
+
+    [void]$btnRow.Children.Add($btnAdd)
+    [void]$btnRow.Children.Add($btnDel)
+    [void]$btnRow.Children.Add($btnClose)
+    [void]$grid.Children.Add($btnRow)
+
+    $dlg.Content = $grid
+    [void]$dlg.ShowDialog()
+}
+
 function global:Open-NicIpConfigDialog {
     param(
         [string]$NicAlias = "",
@@ -619,14 +807,7 @@ function global:Open-NicIpConfigDialog {
             if ($Cfg.UseDhcp) {
                 Enable-AdapterDhcpClean -Alias $Cfg.Nic
             } else {
-                if ($Cfg.Gateway) {
-                    Invoke-NativeCmd "netsh interface ipv4 set address name=`"$($Cfg.Nic)`" static $($Cfg.IP) $($Cfg.Mask) $($Cfg.Gateway) 1"
-                } else {
-                    Invoke-NativeCmd "netsh interface ipv4 set address name=`"$($Cfg.Nic)`" static $($Cfg.IP) $($Cfg.Mask)"
-                }
-                if ($Cfg.DNS) {
-                    Invoke-NativeCmd "netsh interface ipv4 set dnsservers name=`"$($Cfg.Nic)`" static $($Cfg.DNS) primary"
-                }
+                Set-AdapterStaticClean -Alias $Cfg.Nic -IP $Cfg.IP -Mask $Cfg.Mask -Gateway $Cfg.Gateway -DNS $Cfg.DNS
             }
         }
     }
@@ -639,7 +820,7 @@ function global:Open-NicIpConfigDialog {
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="IT-AdminUtil | Console Port&#225;til de Infraestrutura Windows"
-        Height="780" Width="1260" MinHeight="650" MinWidth="1040"
+        Height="790" Width="1280" MinHeight="660" MinWidth="1060"
         WindowStartupLocation="CenterScreen" Background="#1E222A" Foreground="#ABB2BF"
         FontFamily="Segoe UI">
 
@@ -707,6 +888,11 @@ function global:Open-NicIpConfigDialog {
                     </ControlTemplate>
                 </Setter.Value>
             </Setter>
+        </Style>
+
+        <Style x:Key="MiniActionButton" TargetType="Button" BasedOn="{StaticResource ModernButton}">
+            <Setter Property="Padding" Value="8,2"/>
+            <Setter Property="FontSize" Value="11"/>
         </Style>
 
         <Style x:Key="PrimaryButton" TargetType="Button" BasedOn="{StaticResource ModernButton}">
@@ -816,7 +1002,7 @@ function global:Open-NicIpConfigDialog {
                                     <StackPanel>
                                         <DockPanel>
                                             <TextBlock Text="CPU &amp; TEMP" FontSize="11" FontWeight="Bold" Foreground="#9CA3AF"/>
-                                            <TextBlock x:Name="DashCpuTemp" Text="-- &#176;C" FontSize="12" FontWeight="Bold" Foreground="#10B981" HorizontalAlignment="Right"/>
+                                            <TextBlock x:Name="DashCpuTemp" Text="--" FontSize="12" FontWeight="Bold" Foreground="#10B981" HorizontalAlignment="Right"/>
                                         </DockPanel>
                                         <TextBlock x:Name="DashCpuPct" Text="-- %" FontSize="22" FontWeight="Bold" Foreground="#3B82F6" Margin="0,4,0,4"/>
                                         <ProgressBar x:Name="DashCpuBar" Height="6" Minimum="0" Maximum="100" Value="0" Background="#1E222A" Foreground="#3B82F6" BorderThickness="0"/>
@@ -842,9 +1028,13 @@ function global:Open-NicIpConfigDialog {
                                     </StackPanel>
                                 </Border>
 
+                                <!-- KPI UPTIME, LATENCIA & CONECTIVIDADE -->
                                 <Border Style="{StaticResource KpiCard}">
                                     <StackPanel>
-                                        <TextBlock Text="UPTIME &amp; CONECTIVIDADE" FontSize="11" FontWeight="Bold" Foreground="#9CA3AF"/>
+                                        <DockPanel>
+                                            <TextBlock Text="UPTIME &amp; LAT&#202;NCIA" FontSize="11" FontWeight="Bold" Foreground="#9CA3AF"/>
+                                            <TextBlock x:Name="DashLatencyBadge" Text="GW: -- | Net: --" FontSize="11" FontWeight="SemiBold" Foreground="#60A5FA" HorizontalAlignment="Right"/>
+                                        </DockPanel>
                                         <TextBlock x:Name="DashUptime" Text="--d --h --m" FontSize="22" FontWeight="Bold" Foreground="#E5E7EB" Margin="0,4,0,4"/>
                                         <TextBlock x:Name="DashNetStatus" Text="Verificando rede..." FontSize="11.5" FontWeight="SemiBold" Foreground="#10B981" Margin="0,2,0,0"/>
                                         <TextBlock x:Name="DashIpMain" Text="IP: --" FontSize="11" Foreground="#9CA3AF" Margin="0,4,0,0" TextTrimming="CharacterEllipsis"/>
@@ -852,12 +1042,12 @@ function global:Open-NicIpConfigDialog {
                                 </Border>
                             </UniformGrid>
 
-                            <!-- LINHA 2: CONTROLE RAPIDO DE PLACAS DE REDE & DHCP -->
+                            <!-- LINHA 2: CONTROLE RAPIDO DE PLACAS DE REDE, PERFIS IP & DHCP -->
                             <Border Style="{StaticResource CategoryCard}">
                                 <StackPanel>
                                     <DockPanel Margin="0,0,0,8">
-                                        <TextBlock Text="Interfaces de Rede &amp; Troca R&#225;pida de IP / DHCP" FontWeight="Bold" Foreground="#3B82F6" FontSize="14" VerticalAlignment="Center"/>
-                                        <TextBlock Text="Alterne entre DHCP autom&#225;tico ou defina IP est&#225;tico direto por placa" Foreground="#9CA3AF" FontSize="11.5" HorizontalAlignment="Right" VerticalAlignment="Center"/>
+                                        <TextBlock Text="Interfaces de Rede, Perfis IP/VLAN &amp; DHCP" FontWeight="Bold" Foreground="#3B82F6" FontSize="14" VerticalAlignment="Center"/>
+                                        <Button x:Name="BtnManageProfiles" Content="+ Gerenciar Perfis IP" Style="{StaticResource MiniActionButton}" HorizontalAlignment="Right"/>
                                     </DockPanel>
                                     <StackPanel x:Name="DashNicContainer">
                                         <TextBlock Text="Carregando adaptadores de rede..." Foreground="#9CA3AF" FontSize="12"/>
@@ -865,16 +1055,20 @@ function global:Open-NicIpConfigDialog {
                                 </StackPanel>
                             </Border>
 
-                            <!-- LINHA 3: FICHA TECNICA COMPLETA & SENSORES/SERVICOS -->
+                            <!-- LINHA 3: FICHA TECNICA COMPLETA & SERVICOS INTERATIVOS -->
                             <Grid>
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="1.25*"/>
                                     <ColumnDefinition Width="1*"/>
                                 </Grid.ColumnDefinitions>
 
+                                <!-- CARD ESQUERDO: IDENTIDADE & HARDWARE + COPIAR FICHA -->
                                 <Border Grid.Column="0" Style="{StaticResource CategoryCard}">
                                     <StackPanel>
-                                        <TextBlock Text="Ficha T&#233;cnica &amp; Identidade do Equipamento" FontWeight="Bold" Foreground="#3B82F6" FontSize="14" Margin="0,0,0,10"/>
+                                        <DockPanel Margin="0,0,0,10">
+                                            <TextBlock Text="Ficha T&#233;cnica &amp; Identidade do Equipamento" FontWeight="Bold" Foreground="#3B82F6" FontSize="14" VerticalAlignment="Center"/>
+                                            <Button x:Name="BtnCopySpecs" Content="Copiar Ficha" Style="{StaticResource MiniActionButton}" HorizontalAlignment="Right"/>
+                                        </DockPanel>
 
                                         <Grid Margin="0,3">
                                             <Grid.ColumnDefinitions><ColumnDefinition Width="145"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
@@ -929,30 +1123,49 @@ function global:Open-NicIpConfigDialog {
                                     </StackPanel>
                                 </Border>
 
+                                <!-- CARD DIREITO: SERVICOS CRITICOS COM ACOES RAPIDAS & SENSORES -->
                                 <StackPanel Grid.Column="1">
                                     <Border Style="{StaticResource CategoryCard}">
                                         <StackPanel>
-                                            <TextBlock Text="Servi&#231;os Cr&#237;ticos &amp; Seguran&#231;a" FontWeight="Bold" Foreground="#3B82F6" FontSize="14" Margin="0,0,0,8"/>
+                                            <TextBlock Text="Servi&#231;os Cr&#237;ticos &amp; A&#231;&#245;es R&#225;pidas" FontWeight="Bold" Foreground="#3B82F6" FontSize="14" Margin="0,0,0,8"/>
 
-                                            <DockPanel Margin="0,2">
-                                                <TextBlock Text="Spooler de Impress&#227;o:" Foreground="#D1D5DB"/>
-                                                <TextBlock x:Name="DashSvcSpooler" Text="--" FontWeight="Bold" HorizontalAlignment="Right"/>
+                                            <!-- Spooler -->
+                                            <DockPanel Margin="0,3">
+                                                <TextBlock Text="Spooler Impress&#227;o:" Foreground="#D1D5DB" VerticalAlignment="Center"/>
+                                                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                                                    <TextBlock x:Name="DashSvcSpooler" Text="--" FontWeight="Bold" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                                    <Button x:Name="BtnDashFixSpooler" Content="Limpar Fila" Style="{StaticResource MiniActionButton}"/>
+                                                </StackPanel>
                                             </DockPanel>
-                                            <DockPanel Margin="0,2">
-                                                <TextBlock Text="Windows Update (wuauserv):" Foreground="#D1D5DB"/>
-                                                <TextBlock x:Name="DashSvcWU" Text="--" FontWeight="Bold" HorizontalAlignment="Right"/>
+
+                                            <!-- Windows Update -->
+                                            <DockPanel Margin="0,3">
+                                                <TextBlock Text="Windows Update:" Foreground="#D1D5DB" VerticalAlignment="Center"/>
+                                                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                                                    <TextBlock x:Name="DashSvcWU" Text="--" FontWeight="Bold" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                                    <Button x:Name="BtnDashToggleWU" Content="Alternar" Style="{StaticResource MiniActionButton}"/>
+                                                </StackPanel>
                                             </DockPanel>
-                                            <DockPanel Margin="0,2">
-                                                <TextBlock Text="Windows Defender Antiv&#237;rus:" Foreground="#D1D5DB"/>
-                                                <TextBlock x:Name="DashSvcDefender" Text="--" FontWeight="Bold" HorizontalAlignment="Right"/>
+
+                                            <!-- RDP -->
+                                            <DockPanel Margin="0,3">
+                                                <TextBlock Text="Acesso Remoto (RDP):" Foreground="#D1D5DB" VerticalAlignment="Center"/>
+                                                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                                                    <TextBlock x:Name="DashSvcRdp" Text="--" FontWeight="Bold" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                                    <Button x:Name="BtnDashToggleRdp" Content="Alternar" Style="{StaticResource MiniActionButton}"/>
+                                                </StackPanel>
                                             </DockPanel>
-                                            <DockPanel Margin="0,2">
-                                                <TextBlock Text="Acesso Remoto (RDP):" Foreground="#D1D5DB"/>
-                                                <TextBlock x:Name="DashSvcRdp" Text="--" FontWeight="Bold" HorizontalAlignment="Right"/>
+
+                                            <!-- Defender -->
+                                            <DockPanel Margin="0,3">
+                                                <TextBlock Text="Windows Defender:" Foreground="#D1D5DB" VerticalAlignment="Center"/>
+                                                <TextBlock x:Name="DashSvcDefender" Text="--" FontWeight="Bold" HorizontalAlignment="Right" VerticalAlignment="Center"/>
                                             </DockPanel>
-                                            <DockPanel Margin="0,2">
-                                                <TextBlock Text="Criptografia BitLocker (C:):" Foreground="#D1D5DB"/>
-                                                <TextBlock x:Name="DashBitLocker" Text="--" FontWeight="Bold" Foreground="#9CA3AF" HorizontalAlignment="Right"/>
+
+                                            <!-- BitLocker -->
+                                            <DockPanel Margin="0,3">
+                                                <TextBlock Text="BitLocker (C:):" Foreground="#D1D5DB" VerticalAlignment="Center"/>
+                                                <TextBlock x:Name="DashBitLocker" Text="--" FontWeight="Bold" Foreground="#9CA3AF" HorizontalAlignment="Right" VerticalAlignment="Center"/>
                                             </DockPanel>
                                         </StackPanel>
                                     </Border>
@@ -1126,7 +1339,7 @@ function global:Open-NicIpConfigDialog {
             </Border>
         </Grid>
 
-        <!-- CONSOLE INTEGRADO (OCULTO POR PADRAO - ATIVADO VIA TOGGLE NO RODAPE) -->
+        <!-- CONSOLE INTEGRADO -->
         <Border x:Name="ConsolePanel" Grid.Row="2" Background="#161920" BorderBrush="#3E4451" BorderThickness="1" CornerRadius="8" Padding="10" Margin="0,0,0,8" Visibility="Collapsed">
             <Grid>
                 <Grid.RowDefinitions>
@@ -1149,7 +1362,7 @@ function global:Open-NicIpConfigDialog {
             </Grid>
         </Border>
 
-        <!-- BARRA DE STATUS COM CONTROLES DO CONSOLE E POPUP -->
+        <!-- BARRA DE STATUS -->
         <DockPanel Grid.Row="3" Margin="2,2,2,0">
             <TextBlock x:Name="LblStatus" Text="Status: Pronto (Modo Administrador)" Foreground="#9CA3AF" FontSize="11.5" VerticalAlignment="Center"/>
             <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
@@ -1170,6 +1383,8 @@ $XAML.SelectNodes("//*[@*[contains(translate(name(.),'n','N'),'Name')]]") | ForE
     $Controls[$name] = $Window.FindName($name)
 }
 
+$script:LatestDashSnapshot = $null
+
 # ==============================================================================
 # 8. CONSTRUTOR DINAMICO DAS LINHAS DE PLACAS DE REDE NO DASHBOARD
 # ==============================================================================
@@ -1186,6 +1401,8 @@ function Render-DashboardNics {
         return
     }
 
+    $profiles = Get-IpProfiles
+
     foreach ($nic in $NicList) {
         $rowBorder = New-Object System.Windows.Controls.Border
         $rowBorder.Background = "#1E222A"
@@ -1196,13 +1413,14 @@ function Render-DashboardNics {
         $rowBorder.Margin = "0,0,0,6"
 
         $grid = New-Object System.Windows.Controls.Grid
-        $c1 = New-Object System.Windows.Controls.ColumnDefinition; $c1.Width = "1.4*"
-        $c2 = New-Object System.Windows.Controls.ColumnDefinition; $c2.Width = "1.2*"
+        $c1 = New-Object System.Windows.Controls.ColumnDefinition; $c1.Width = "1.35*"
+        $c2 = New-Object System.Windows.Controls.ColumnDefinition; $c2.Width = "1.15*"
         $c3 = New-Object System.Windows.Controls.ColumnDefinition; $c3.Width = "Auto"
         [void]$grid.ColumnDefinitions.Add($c1)
         [void]$grid.ColumnDefinitions.Add($c2)
         [void]$grid.ColumnDefinitions.Add($c3)
 
+        # Coluna 1: Nome da Placa + Status
         $spInfo = New-Object System.Windows.Controls.StackPanel
         $spInfo.VerticalAlignment = "Center"
         $spTitle = New-Object System.Windows.Controls.StackPanel
@@ -1235,6 +1453,7 @@ function Render-DashboardNics {
         [System.Windows.Controls.Grid]::SetColumn($spInfo, 0)
         [void]$grid.Children.Add($spInfo)
 
+        # Coluna 2: IP Atual + Modo DHCP/Estatico
         $spIp = New-Object System.Windows.Controls.StackPanel
         $spIp.VerticalAlignment = "Center"
 
@@ -1256,10 +1475,12 @@ function Render-DashboardNics {
         [System.Windows.Controls.Grid]::SetColumn($spIp, 1)
         [void]$grid.Children.Add($spIp)
 
+        # Coluna 3: Botoes (Ativar DHCP | Perfis IP | Definir IP Fixo)
         $spBtns = New-Object System.Windows.Controls.StackPanel
         $spBtns.Orientation = "Horizontal"
         $spBtns.VerticalAlignment = "Center"
 
+        # 1. Botao DHCP
         $btnDhcp = New-Object System.Windows.Controls.Button
         $btnDhcp.Content = if ($nic.DhcpEnabled) { "DHCP Ativo" } else { "Ativar DHCP" }
         $btnDhcp.Padding = "10,5"
@@ -1280,6 +1501,41 @@ function Render-DashboardNics {
             }
         })
 
+        # 2. Botao Perfis IP (Menu Suspenso com 1 Clique)
+        $btnPresets = New-Object System.Windows.Controls.Button
+        $btnPresets.Content = "Perfis IP " + [char]9662
+        $btnPresets.Padding = "10,5"
+        $btnPresets.Margin = "0,0,6,0"
+        $btnPresets.FontSize = 11.5
+        $btnPresets.Cursor = "Hand"
+        $btnPresets.Background = "#282C34"
+        $btnPresets.Foreground = "#E5E7EB"
+        $btnPresets.BorderBrush = "#3E4451"
+
+        $ctxMenu = New-Object System.Windows.Controls.ContextMenu
+        foreach ($prof in $profiles) {
+            $mi = New-Object System.Windows.Controls.MenuItem
+            $mi.Header = "$($prof.Name) [$($prof.IP)]"
+            $mi.Tag = @{ Nic = $nic.Alias; Prof = $prof }
+            $mi.Add_Click({
+                param($s, $ev)
+                $data = $s.Tag
+                $p = $data.Prof
+                Invoke-AsyncTask -TaskName "Aplicar Perfil '$($p.Name)' ($($data.Nic))" -AutoRefreshDashboard $true -Parameters @{Alias=$data.Nic; Prof=$p} -ScriptBlock {
+                    param($Alias, $Prof)
+                    Set-AdapterStaticClean -Alias $Alias -IP $Prof.IP -Mask $Prof.Mask -Gateway $Prof.Gateway -DNS $Prof.DNS
+                }
+            })
+            [void]$ctxMenu.Items.Add($mi)
+        }
+        $btnPresets.ContextMenu = $ctxMenu
+        $btnPresets.Add_Click({
+            param($sender, $e)
+            $sender.ContextMenu.PlacementTarget = $sender
+            $sender.ContextMenu.IsOpen = $true
+        })
+
+        # 3. Botao IP Fixo Manual
         $btnStatic = New-Object System.Windows.Controls.Button
         $btnStatic.Content = "Definir IP Fixo"
         $btnStatic.Padding = "10,5"
@@ -1297,6 +1553,7 @@ function Render-DashboardNics {
         })
 
         [void]$spBtns.Children.Add($btnDhcp)
+        [void]$spBtns.Children.Add($btnPresets)
         [void]$spBtns.Children.Add($btnStatic)
         [System.Windows.Controls.Grid]::SetColumn($spBtns, 2)
         [void]$grid.Children.Add($spBtns)
@@ -1339,6 +1596,7 @@ $UiTimer.Add_Tick({
     if ($SyncHash.DashboardReady -and $SyncHash.DashboardData) {
         $SyncHash.DashboardReady = $false
         $d = $SyncHash.DashboardData
+        $script:LatestDashSnapshot = $d
 
         $Controls.DashCpuPct.Text = "$($d.CpuLoad)%"
         $Controls.DashCpuBar.Value = $d.CpuLoad
@@ -1359,6 +1617,7 @@ $UiTimer.Add_Tick({
         $Controls.DashDiskSub.Text = "$($d.DiskFree) GB livres ($($d.DiskPct)% usado)"
 
         $Controls.DashUptime.Text = $d.Uptime
+        $Controls.DashLatencyBadge.Text = "GW: $($d.GwLatency) | Net: $($d.WanLatency)"
         $Controls.DashNetStatus.Text = if ($d.InternetOk) { "ONLINE (Internet OK)" } else { "OFFLINE / SEM INTERNET" }
         $Controls.DashNetStatus.Foreground = if ($d.InternetOk) { "#10B981" } else { "#F87171" }
         $Controls.DashIpMain.Text = "IP: $($d.IpAddress)"
@@ -1382,12 +1641,14 @@ $UiTimer.Add_Tick({
 
         $Controls.DashSvcWU.Text       = if ($d.SvcWU) { "ATIVO" } else { "PARADO" }
         $Controls.DashSvcWU.Foreground = if ($d.SvcWU) { "#10B981" } else { "#F59E0B" }
+        $Controls.BtnDashToggleWU.Content = if ($d.SvcWU) { "Parar" } else { "Iniciar" }
 
         $Controls.DashSvcDefender.Text       = if ($d.SvcDefender) { "ATIVO" } else { "DESATIVADO" }
         $Controls.DashSvcDefender.Foreground = if ($d.SvcDefender) { "#10B981" } else { "#F87171" }
 
         $Controls.DashSvcRdp.Text       = if ($d.SvcRdp) { "ATIVADO" } else { "DESATIVADO" }
         $Controls.DashSvcRdp.Foreground = if ($d.SvcRdp) { "#3B82F6" } else { "#9CA3AF" }
+        $Controls.BtnDashToggleRdp.Content = if ($d.SvcRdp) { "Desativar" } else { "Ativar" }
 
         $Controls.DashBitLocker.Text       = $d.BitLocker
         $Controls.DashBitLocker.Foreground = if ($d.BitLocker -like "Ativo*") { "#10B981" } else { "#9CA3AF" }
@@ -1557,10 +1818,78 @@ $Controls.TxtSearch.Add_TextChanged({
 })
 
 # ==============================================================================
-# 13. EVENTOS DO PAINEL LATERAL E CONSOLE
+# 13. EVENTOS DO DASHBOARD, PAINEL LATERAL E CONSOLE
 # ==============================================================================
 $Controls.BtnRefreshDash.Add_Click({ Update-DashboardAsync })
 $Controls.BtnClearLog.Add_Click({ $Controls.TxtConsole.Clear(); $SyncHash.ErrorCount = 0 })
+
+$Controls.BtnManageProfiles.Add_Click({
+    Open-ManageIpProfilesDialog
+    if ($script:LatestDashSnapshot -and $script:LatestDashSnapshot.NicList) {
+        Render-DashboardNics -NicList $script:LatestDashSnapshot.NicList
+    }
+})
+
+$Controls.BtnCopySpecs.Add_Click({
+    $d = $script:LatestDashSnapshot
+    if (-not $d) { return }
+    $nicsTxt = ($d.NicList | ForEach-Object { "- $($_.Alias) ($($_.StatusText)): $($_.IPv4) [$($_.ModeText)]" }) -join "`r`n"
+    $summary = @"
+=== FICHA TECNICA - $($d.Hostname) ===
+Usuario: $($d.User) | Rede: $($d.Domain)
+Modelo: $($d.Model)
+Placa-Mae: $($d.Motherboard)
+Serial BIOS: $($d.BiosSerial)
+Processador: $($d.CpuName) ($($d.CpuCores))
+Memoria RAM: $($d.RamTotal) GB ($($d.RamSlots))
+Disco C:: $($d.DiskUsed) / $($d.DiskTotal) GB ($($d.DiskFree) GB livres)
+Sistema: $($d.OsCaption)
+Uptime: $($d.Uptime)
+Interfaces de Rede:
+$nicsTxt
+"@
+    [System.Windows.Clipboard]::SetText($summary)
+    Write-AppLog "Ficha tecnica e Serial BIOS ($($d.BiosSerial)) copiados para a area de transferencia." "OK"
+})
+
+$Controls.BtnDashFixSpooler.Add_Click({
+    Invoke-AsyncTask -TaskName "Limpar Fila e Reiniciar Spooler" -AutoRefreshDashboard $true -ScriptBlock {
+        Write-TaskLog "Parando Spooler, limpando PRINTERS e reiniciando servico..." "CMD"
+        Stop-Service -Name Spooler -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path "$env:WINDIR\System32\spool\PRINTERS\*" -Force -ErrorAction SilentlyContinue
+        Start-Service -Name Spooler
+    }
+})
+
+$Controls.BtnDashToggleWU.Add_Click({
+    $isRunning = ($script:LatestDashSnapshot -and $script:LatestDashSnapshot.SvcWU)
+    if ($isRunning) {
+        Invoke-AsyncTask -TaskName "Parar Windows Update" -AutoRefreshDashboard $true -ScriptBlock {
+            Stop-Service -Name wuauserv -Force
+        }
+    } else {
+        Invoke-AsyncTask -TaskName "Iniciar Windows Update" -AutoRefreshDashboard $true -ScriptBlock {
+            Set-Service -Name wuauserv -StartupType Manual -ErrorAction SilentlyContinue
+            Start-Service -Name wuauserv
+        }
+    }
+})
+
+$Controls.BtnDashToggleRdp.Add_Click({
+    $isRdpOn = ($script:LatestDashSnapshot -and $script:LatestDashSnapshot.SvcRdp)
+    if ($isRdpOn) {
+        Invoke-AsyncTask -TaskName "Desativar RDP" -AutoRefreshDashboard $true -ScriptBlock {
+            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 1
+            Invoke-NativeCmd "netsh advfirewall firewall set rule group=`"remote desktop`" new enable=No"
+        }
+    } else {
+        Invoke-AsyncTask -TaskName "Ativar RDP e Firewall" -AutoRefreshDashboard $true -ScriptBlock {
+            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+            Invoke-NativeCmd "netsh advfirewall firewall set rule group=`"remote desktop`" new enable=Yes"
+            Invoke-NativeCmd "netsh advfirewall firewall set rule group=`"Área de Trabalho Remota`" new enable=Yes"
+        }
+    }
+})
 
 $Controls.BtnLastResults.Add_Click({
     if ($SyncHash.ResultTabs.Count -gt 0) {
@@ -1595,7 +1924,7 @@ $Controls.BtnClearSelection.Add_Click({
 })
 
 # ==============================================================================
-# 14. EVENTOS DE BOTOES DIRETOS
+# 14. EVENTOS DE BOTOES DIRETOS DAS DEMAIS ABAS
 # ==============================================================================
 
 # --- ABA 1: USUARIOS ---
@@ -1800,6 +2129,8 @@ $Controls.BtnRunSelected.Add_Click({
     Invoke-AsyncTask -TaskName "Lote de Tarefas ($($selectedTags.Count) itens)" -Parameters @{Tags=$selectedTags} -ScriptBlock {
         param($Tags)
 
+        $deg = [char]176
+
         $wingetMap = @{
             "Wgt_Chrome"      = "Google.Chrome"
             "Wgt_7Zip"        = "7zip.7zip"
@@ -1820,7 +2151,6 @@ $Controls.BtnRunSelected.Add_Click({
             }
 
             switch ($tag) {
-                # ABA 1
                 "Usr_ListLocal" {
                     Write-TaskLog "Consultando Win32_UserAccount (LocalAccount=True)..." "CMD"
                     $out = Get-CimInstance Win32_UserAccount -Filter "LocalAccount=True" |
@@ -1833,17 +2163,10 @@ $Controls.BtnRunSelected.Add_Click({
                     if (-not $grp) { $grp = "Administradores" }
                     Invoke-NativeCmd -CmdLine "net localgroup `"$grp`"" -ResultTabTitle "Grupo Administradores"
                 }
-                "Usr_ADStatus" {
-                    Invoke-NativeCmd -CmdLine "dsregcmd /status" -ResultTabTitle "Status Dominio / AD"
-                }
-                "Usr_Gpupdate" {
-                    Invoke-NativeCmd -CmdLine "gpupdate /force" -ResultTabTitle "GPUpdate"
-                }
-                "Usr_Gpresult" {
-                    Invoke-NativeCmd -CmdLine "gpresult /r" -ResultTabTitle "GPResult (GPOs)"
-                }
+                "Usr_ADStatus" { Invoke-NativeCmd -CmdLine "dsregcmd /status" -ResultTabTitle "Status Dominio / AD" }
+                "Usr_Gpupdate" { Invoke-NativeCmd -CmdLine "gpupdate /force" -ResultTabTitle "GPUpdate" }
+                "Usr_Gpresult" { Invoke-NativeCmd -CmdLine "gpresult /r" -ResultTabTitle "GPResult (GPOs)" }
 
-                # ABA 2
                 "Net_Ipconfig"     { Invoke-NativeCmd -CmdLine "ipconfig /all" -ResultTabTitle "IPConfig /all" }
                 "Net_Arp"          { Invoke-NativeCmd -CmdLine "arp -a" -ResultTabTitle "Tabela ARP" }
                 "Net_Route"        { Invoke-NativeCmd -CmdLine "route print" -ResultTabTitle "Tabela de Rotas" }
@@ -1859,7 +2182,6 @@ $Controls.BtnRunSelected.Add_Click({
                     Add-TaskResult -TabTitle "Teste Internet" -Content "Ping 8.8.8.8 (Google DNS): $g`r`nPing 1.1.1.1 (Cloudflare DNS): $c"
                 }
 
-                # ABA 3
                 "Mch_Inventory" {
                     Write-TaskLog "Coletando inventario de hardware via CIM..." "CMD"
                     $cpu = (Get-CimInstance Win32_Processor).Name
@@ -1884,7 +2206,7 @@ Tempo Ligado (Uptime): $($uptime.Days) dias, $($uptime.Hours) horas, $($uptime.M
                     $disks = Get-PhysicalDisk | ForEach-Object {
                         $rel = $_ | Get-StorageReliabilityCounter -ErrorAction SilentlyContinue
                         $gb = [math]::Round($_.Size / 1GB, 1)
-                        "Disco: $($_.FriendlyName) ($gb GB | $($_.MediaType))`r`nSaude: $($_.HealthStatus) | Desgaste: $($rel.Wear)% | Temp: $($rel.Temperature)°C | Horas Ligado: $($rel.PowerOnHours)h`r`n----------------------------------------"
+                        "Disco: $($_.FriendlyName) ($gb GB | $($_.MediaType))`r`nSaude: $($_.HealthStatus) | Desgaste: $($rel.Wear)% | Temp: $($rel.Temperature)${deg}C | Horas Ligado: $($rel.PowerOnHours)h`r`n----------------------------------------"
                     }
                     Add-TaskResult -TabTitle "Saude Discos (SMART)" -Content ($disks -join "`r`n")
                 }
@@ -1913,7 +2235,6 @@ Tempo Ligado (Uptime): $($uptime.Days) dias, $($uptime.Hours) horas, $($uptime.M
                 "Mch_Sfc"  { Invoke-NativeCmd -CmdLine "sfc /scannow" -ResultTabTitle "SFC Scannow" }
                 "Mch_Dism" { Invoke-NativeCmd -CmdLine "DISM /Online /Cleanup-Image /RestoreHealth" -ResultTabTitle "DISM RestoreHealth" }
 
-                # ABA 4
                 "Prt_ListAll" {
                     Write-TaskLog "Consultando Win32_Printer e Win32_TCPIPPrinterPort..." "CMD"
                     $prts = Get-CimInstance Win32_Printer | Select-Object Name, DriverName, PortName, WorkOffline | Format-Table -AutoSize | Out-String
