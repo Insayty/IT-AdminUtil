@@ -2,10 +2,10 @@
 .SYNOPSIS
     IT-AdminUtil - Console Portatil de Administracao de TI (Estilo WinUtil)
 .DESCRIPTION
-    Utilitario completo em PowerShell + WPF para gestao de Usuarios/AD, Redes,
-    Manutencao de Maquinas, Impressoras/Spooler e Deploy via Winget.
-    Console inferior dedicado a auditoria de comandos/erros e janela popup com
-    abas individuais para exibicao de resultados e relatorios.
+    Utilitario completo em PowerShell + WPF com Dashboard de Telemetria em tempo real,
+    gestao de Usuarios/AD, Redes, Manutencao de Maquinas, Impressoras/Spooler e Winget.
+    Console inferior dedicado a auditoria de comandos/erros e janela popup com abas
+    para exibicao de relatorios detalhados.
 #>
 
 # ==============================================================================
@@ -32,11 +32,13 @@ Add-Type -AssemblyName System.Windows.Forms
 # 2. ESTADO SINCRONIZADO ENTRE UI E RUNSPACES (THREAD-SAFE)
 # ==============================================================================
 $SyncHash = [hashtable]::Synchronized(@{
-    LogQueue     = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
-    ResultTabs   = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
-    ShowResults  = $false
-    IsBusy       = $false
-    StatusText   = "Pronto"
+    LogQueue      = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
+    ResultTabs    = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
+    ShowResults   = $false
+    IsBusy        = $false
+    StatusText    = "Pronto"
+    DashboardData = $null
+    DashboardReady = $false
 })
 
 function global:Write-AppLog {
@@ -53,7 +55,7 @@ function global:Write-AppLog {
 }
 
 # ==============================================================================
-# 3. MOTOR DE EXECUCAO ASSINCRONA (SEPARA LOG DE AUDITORIA E RESULTADOS)
+# 3. MOTOR DE EXECUCAO ASSINCRONA (RUNSPACES COM ESCOPO E MODULOS INJETADOS)
 # ==============================================================================
 function global:Invoke-AsyncTask {
     param(
@@ -93,14 +95,12 @@ function global:Invoke-AsyncTask {
         Import-Module Microsoft.PowerShell.Utility -ErrorAction SilentlyContinue
         Import-Module CimCmdlets -ErrorAction SilentlyContinue
 
-        # Registra apenas status/comandos/erros no console inferior
         function global:Write-TaskLog {
             param([string]$Msg, [string]$Lvl = "INFO")
             $ts = (Get-Date).ToString("HH:mm:ss")
             $Sync.LogQueue.Enqueue("[$ts] [$Lvl] $Msg")
         }
 
-        # Adiciona uma aba de resultado para ser exibida no Popup ao final
         function global:Add-TaskResult {
             param([string]$TabTitle, [string]$Content)
             if (-not [string]::IsNullOrWhiteSpace($Content)) {
@@ -111,7 +111,6 @@ function global:Invoke-AsyncTask {
             }
         }
 
-        # Executa comando nativo: loga o comando no console e envia saida para Popup (se ShowPopup = $true)
         function global:Invoke-NativeCmd {
             param(
                 [string]$CmdLine,
@@ -167,7 +166,120 @@ function global:Invoke-AsyncTask {
 }
 
 # ==============================================================================
-# 4. JANELA POPUP COM ABAS PARA EXIBICAO DOS RESULTADOS
+# 4. COLETA ASSINCRONA DEDICADA DO DASHBOARD INICIAL
+# ==============================================================================
+function global:Update-DashboardAsync {
+    $SyncHash.StatusText = "Coletando telemetria do Dashboard..."
+    Write-AppLog "Atualizando telemetria geral da maquina no Dashboard..." "CMD"
+
+    $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+    $rs = [runspacefactory]::CreateRunspace($iss)
+    $rs.ApartmentState = "STA"
+    $rs.Open()
+    $rs.SessionStateProxy.SetVariable("SyncHash", $SyncHash)
+
+    $ps = [powershell]::Create()
+    $ps.Runspace = $rs
+
+    $dashScript = {
+        param($Sync)
+        Import-Module Microsoft.PowerShell.Management -ErrorAction SilentlyContinue
+        Import-Module CimCmdlets -ErrorAction SilentlyContinue
+
+        try {
+            $cs    = Get-CimInstance Win32_ComputerSystem
+            $os    = Get-CimInstance Win32_OperatingSystem
+            $cpu   = Get-CimInstance Win32_Processor | Select-Object -First 1
+            $bios  = Get-CimInstance Win32_BIOS
+            $board = Get-CimInstance Win32_BaseBoard
+            $gpus  = (Get-CimInstance Win32_VideoController).Name -join " | "
+            $bat   = Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue
+
+            # RAM
+            $totalRamGB = [math]::Round($cs.TotalPhysicalMemory / 1GB, 1)
+            $freeRamGB  = [math]::Round(($os.FreePhysicalMemory * 1KB) / 1GB, 1)
+            $usedRamGB  = [math]::Round($totalRamGB - $freeRamGB, 1)
+            $ramPct     = if ($totalRamGB -gt 0) { [math]::Round(($usedRamGB / $totalRamGB) * 100, 0) } else { 0 }
+
+            # Disco C:
+            $sysDrive   = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'" -ErrorAction SilentlyContinue
+            $diskTotal  = if ($sysDrive) { [math]::Round($sysDrive.Size / 1GB, 0) } else { 0 }
+            $diskFree   = if ($sysDrive) { [math]::Round($sysDrive.FreeSpace / 1GB, 0) } else { 0 }
+            $diskUsed   = $diskTotal - $diskFree
+            $diskPct    = if ($diskTotal -gt 0) { [math]::Round(($diskUsed / $diskTotal) * 100, 0) } else { 0 }
+
+            # Discos SMART
+            $smartList = (Get-CimInstance Win32_DiskDrive | ForEach-Object {
+                "$($_.Model) [$([math]::Round($_.Size/1GB,0))GB - $($_.Status)]"
+            }) -join "`n"
+
+            # Rede
+            $nicCfg = Get-CimInstance Win32_NetworkAdapterConfiguration -Filter "IPEnabled=True" | Select-Object -First 1
+            $ipAddr = if ($nicCfg.IPAddress) { ($nicCfg.IPAddress | Where-Object { $_ -match '^\d+\.' }) -join ", " } else { "Sem IP" }
+            $gwAddr = if ($nicCfg.DefaultIPGateway) { $nicCfg.DefaultIPGateway -join ", " } else { "N/D" }
+            $dnsAddr = if ($nicCfg.DNSServerSearchOrder) { $nicCfg.DNSServerSearchOrder -join ", " } else { "N/D" }
+            $netOnline = Test-Connection 8.8.8.8 -Count 1 -Quiet
+
+            # Uptime
+            $up = (Get-Date) - $os.LastBootUpTime
+            $uptimeStr = "$($up.Days)d $($up.Hours)h $($up.Minutes)m"
+
+            # Servicos Criticos
+            $spooler = (Get-Service Spooler -ErrorAction SilentlyContinue).Status -eq "Running"
+            $wuauserv = (Get-Service wuauserv -ErrorAction SilentlyContinue).Status -eq "Running"
+            $defender = (Get-Service WinDefend -ErrorAction SilentlyContinue).Status -eq "Running"
+            $rdpVal = (Get-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -ErrorAction SilentlyContinue).fDenyTSConnections
+            $rdpEnabled = ($rdpVal -eq 0)
+
+            # Bateria
+            $batStr = if ($bat) { "$($bat.EstimatedChargeRemaining)% ($($bat.Status))" } else { "N/A (Desktop / Sem Bateria)" }
+
+            $Sync.DashboardData = @{
+                CpuLoad      = [int]$cpu.LoadPercentage
+                CpuName      = $cpu.Name.Trim()
+                CpuCores     = "$($cpu.NumberOfCores) Cores / $($cpu.NumberOfLogicalProcessors) Threads"
+                RamUsed      = $usedRamGB
+                RamTotal     = $totalRamGB
+                RamPct       = $ramPct
+                DiskUsed     = $diskUsed
+                DiskTotal    = $diskTotal
+                DiskFree     = $diskFree
+                DiskPct      = $diskPct
+                SmartSummary = $smartList
+                Hostname     = $env:COMPUTERNAME
+                User         = $env:USERNAME
+                Domain       = "$($cs.Domain) ($(if($cs.PartOfDomain){'Dominio AD'}else{'Workgroup'}))"
+                Model        = "$($cs.Manufacturer) $($cs.Model)"
+                Motherboard  = "$($board.Manufacturer) $($board.Product)"
+                BiosSerial   = $bios.SerialNumber
+                Gpu          = $gpus
+                OsCaption    = "$($os.Caption) (Build $($os.BuildNumber))"
+                Uptime       = $uptimeStr
+                Battery      = $batStr
+                IpAddress    = $ipAddr
+                Gateway      = $gwAddr
+                Dns          = $dnsAddr
+                InternetOk   = $netOnline
+                SvcSpooler   = $spooler
+                SvcWU        = $wuauserv
+                SvcDefender  = $defender
+                SvcRdp       = $rdpEnabled
+            }
+            $Sync.DashboardReady = $true
+            $Sync.LogQueue.Enqueue("[" + (Get-Date).ToString("HH:mm:ss") + "] [OK] Telemetria do Dashboard atualizada.")
+        } catch {
+            $Sync.LogQueue.Enqueue("[" + (Get-Date).ToString("HH:mm:ss") + "] [ERRO] Falha ao carregar Dashboard: $($_.Exception.Message)")
+        } finally {
+            $Sync.StatusText = "Pronto"
+        }
+    }
+
+    [void]$ps.AddScript($dashScript).AddArgument($SyncHash)
+    $null = $ps.BeginInvoke()
+}
+
+# ==============================================================================
+# 5. JANELA POPUP COM ABAS PARA EXIBICAO DOS RESULTADOS
 # ==============================================================================
 function Show-ResultsPopup {
     param([System.Collections.ArrayList]$TabsData)
@@ -178,7 +290,7 @@ function Show-ResultsPopup {
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="Resultados da Execu&#231;&#227;o | IT-AdminUtil"
-        Height="580" Width="880" MinHeight="420" MinWidth="640"
+        Height="580" Width="900" MinHeight="420" MinWidth="640"
         WindowStartupLocation="CenterOwner" Background="#1E222A" Foreground="#E5E7EB"
         FontFamily="Segoe UI">
     <Grid Margin="14">
@@ -224,6 +336,7 @@ function Show-ResultsPopup {
         <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
             <Button x:Name="BtnCopyTab" Content="Copiar Aba Atual" Background="#282C34" Foreground="#E5E7EB" BorderBrush="#3E4451" Padding="14,7" Margin="0,0,8,0" Cursor="Hand"/>
             <Button x:Name="BtnSaveTab" Content="Salvar Aba (.txt)" Background="#282C34" Foreground="#E5E7EB" BorderBrush="#3E4451" Padding="14,7" Margin="0,0,8,0" Cursor="Hand"/>
+            <Button x:Name="BtnSaveAll" Content="Salvar Tudo (.txt)" Background="#282C34" Foreground="#E5E7EB" BorderBrush="#3E4451" Padding="14,7" Margin="0,0,8,0" Cursor="Hand"/>
             <Button x:Name="BtnCloseRes" Content="Fechar" Background="#2B579A" Foreground="#FFFFFF" BorderBrush="#3B82F6" FontWeight="Bold" Padding="18,7" Cursor="Hand"/>
         </StackPanel>
     </Grid>
@@ -234,10 +347,11 @@ function Show-ResultsPopup {
     $resWin = [Windows.Markup.XamlReader]::Load($rReader)
     $resWin.Owner = $Window
 
-    $tabCtrl = $resWin.FindName("ResultTabControl")
+    $tabCtrl  = $resWin.FindName("ResultTabControl")
     $lblCount = $resWin.FindName("LblTabCount")
-    $btnCopy = $resWin.FindName("BtnCopyTab")
-    $btnSave = $resWin.FindName("BtnSaveTab")
+    $btnCopy  = $resWin.FindName("BtnCopyTab")
+    $btnSave  = $resWin.FindName("BtnSaveTab")
+    $btnAll   = $resWin.FindName("BtnSaveAll")
     $btnClose = $resWin.FindName("BtnCloseRes")
 
     $lblCount.Text = "$($TabsData.Count) resultado(s) gerado(s)"
@@ -266,7 +380,7 @@ function Show-ResultsPopup {
     $btnCopy.Add_Click({
         if ($tabCtrl.SelectedItem -and $tabCtrl.SelectedItem.Content) {
             [System.Windows.Clipboard]::SetText($tabCtrl.SelectedItem.Content.Text)
-            Write-AppLog "Conteudo da aba '$($tabCtrl.SelectedItem.Header)' copiado para a area de transferencia." "OK"
+            Write-AppLog "Conteudo da aba '$($tabCtrl.SelectedItem.Header)' copiado." "OK"
         }
     })
 
@@ -283,18 +397,38 @@ function Show-ResultsPopup {
         }
     })
 
+    $btnAll.Add_Click({
+        $sfd = New-Object Microsoft.Win32.SaveFileDialog
+        $sfd.Filter = "Arquivo de Texto (*.txt)|*.txt"
+        $sfd.FileName = "Relatorio_Completo_$($env:COMPUTERNAME)_$(Get-Date -Format 'yyyyMMdd_HHmm').txt"
+        if ($sfd.ShowDialog() -eq $true) {
+            $full = New-Object System.Text.StringBuilder
+            [void]$full.AppendLine("============================================================")
+            [void]$full.AppendLine("RELATORIO CONSOLIDADO - IT-ADMINUTIL ($($env:COMPUTERNAME))")
+            [void]$full.AppendLine("Data: $(Get-Date -Format 'dd/MM/yyyy HH:mm:ss')")
+            [void]$full.AppendLine("============================================================`r`n")
+            foreach ($t in $TabsData) {
+                [void]$full.AppendLine("### $($t.Title) ###")
+                [void]$full.AppendLine($t.Content)
+                [void]$full.AppendLine("`r`n------------------------------------------------------------`r`n")
+            }
+            $full.ToString() | Out-File -FilePath $sfd.FileName -Encoding UTF8
+            Write-AppLog "Relatorio consolidado salvo em: $($sfd.FileName)" "OK"
+        }
+    })
+
     $btnClose.Add_Click({ $resWin.Close() })
     [void]$resWin.ShowDialog()
 }
 
 # ==============================================================================
-# 5. INTERFACE GRAFICA WPF PRINCIPAL
+# 6. INTERFACE GRAFICA WPF PRINCIPAL (COM ABA 0: DASHBOARD GERAL)
 # ==============================================================================
 [xml]$XAML = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="IT-AdminUtil | Console Port&#225;til de Infraestrutura Windows"
-        Height="760" Width="1200" MinHeight="650" MinWidth="980"
+        Height="780" Width="1240" MinHeight="660" MinWidth="1020"
         WindowStartupLocation="CenterScreen" Background="#1E222A" Foreground="#ABB2BF"
         FontFamily="Segoe UI">
 
@@ -304,9 +438,9 @@ function Show-ResultsPopup {
             <Setter Property="Foreground" Value="#ABB2BF"/>
             <Setter Property="BorderBrush" Value="#3E4451"/>
             <Setter Property="BorderThickness" Value="1"/>
-            <Setter Property="Padding" Value="16,8"/>
-            <Setter Property="Margin" Value="0,0,8,0"/>
-            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="Padding" Value="14,8"/>
+            <Setter Property="Margin" Value="0,0,6,0"/>
+            <Setter Property="FontSize" Value="12.5"/>
             <Setter Property="FontWeight" Value="SemiBold"/>
             <Setter Property="Cursor" Value="Hand"/>
             <Setter Property="Template">
@@ -377,7 +511,16 @@ function Show-ResultsPopup {
             <Setter Property="BorderThickness" Value="1"/>
             <Setter Property="CornerRadius" Value="8"/>
             <Setter Property="Padding" Value="14"/>
-            <Setter Property="Margin" Value="6"/>
+            <Setter Property="Margin" Value="5"/>
+        </Style>
+
+        <Style x:Key="KpiCard" TargetType="Border">
+            <Setter Property="Background" Value="#282C34"/>
+            <Setter Property="BorderBrush" Value="#3E4451"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="CornerRadius" Value="8"/>
+            <Setter Property="Padding" Value="12"/>
+            <Setter Property="Margin" Value="5"/>
         </Style>
 
         <Style TargetType="CheckBox">
@@ -392,21 +535,22 @@ function Show-ResultsPopup {
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
-            <RowDefinition Height="175"/>
+            <RowDefinition Height="165"/>
             <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
 
         <!-- BARRA SUPERIOR -->
-        <Border Grid.Row="0" Background="#282C34" BorderBrush="#3E4451" BorderThickness="1" CornerRadius="8" Padding="12" Margin="0,0,0,10">
+        <Border Grid.Row="0" Background="#282C34" BorderBrush="#3E4451" BorderThickness="1" CornerRadius="8" Padding="10" Margin="0,0,0,10">
             <Grid>
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*"/>
-                    <ColumnDefinition Width="270"/>
+                    <ColumnDefinition Width="240"/>
                 </Grid.ColumnDefinitions>
 
                 <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-                    <TextBlock Text="IT-AdminUtil" FontSize="17" FontWeight="Bold" Foreground="#3B82F6" VerticalAlignment="Center" Margin="0,0,18,0"/>
-                    <RadioButton x:Name="TabUsers" Content="1. Usu&#225;rios &amp; AD" Style="{StaticResource TabPillButton}" IsChecked="True"/>
+                    <TextBlock Text="IT-AdminUtil" FontSize="17" FontWeight="Bold" Foreground="#3B82F6" VerticalAlignment="Center" Margin="4,0,14,0"/>
+                    <RadioButton x:Name="TabDashboard" Content="0. Dashboard" Style="{StaticResource TabPillButton}" IsChecked="True"/>
+                    <RadioButton x:Name="TabUsers" Content="1. Usu&#225;rios &amp; AD" Style="{StaticResource TabPillButton}"/>
                     <RadioButton x:Name="TabNetwork" Content="2. Redes &amp; Conectividade" Style="{StaticResource TabPillButton}"/>
                     <RadioButton x:Name="TabMachines" Content="3. Gest&#227;o de M&#225;quinas" Style="{StaticResource TabPillButton}"/>
                     <RadioButton x:Name="TabPrinters" Content="4. Impressoras &amp; Spooler" Style="{StaticResource TabPillButton}"/>
@@ -414,8 +558,8 @@ function Show-ResultsPopup {
 
                 <Grid Grid.Column="1" VerticalAlignment="Center">
                     <TextBox x:Name="TxtSearch" Background="#1E222A" Foreground="#FFFFFF" BorderBrush="#3E4451"
-                             BorderThickness="1" Padding="10,6" FontSize="12.5" VerticalContentAlignment="Center"/>
-                    <TextBlock x:Name="TxtSearchPlaceholder" Text="Filtrar ferramentas na tela..." Foreground="#6B7280"
+                             BorderThickness="1" Padding="10,6" FontSize="12" VerticalContentAlignment="Center"/>
+                    <TextBlock x:Name="TxtSearchPlaceholder" Text="Filtrar ferramentas..." Foreground="#6B7280"
                                IsHitTestVisible="False" VerticalAlignment="Center" Margin="12,0,0,0" FontSize="12"/>
                 </Grid>
             </Grid>
@@ -424,7 +568,7 @@ function Show-ResultsPopup {
         <!-- CORPO PRINCIPAL -->
         <Grid Grid.Row="1" Margin="0,0,0,10">
             <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="255"/>
+                <ColumnDefinition Width="250"/>
                 <ColumnDefinition Width="*"/>
             </Grid.ColumnDefinitions>
 
@@ -433,7 +577,7 @@ function Show-ResultsPopup {
                 <DockPanel LastChildFill="False">
                     <TextBlock DockPanel.Dock="Top" Text="&#9889; A&#199;&#213;ES R&#193;PIDAS" FontWeight="Bold" Foreground="#3B82F6" FontSize="12" Margin="0,0,0,10"/>
 
-                    <Button DockPanel.Dock="Top" x:Name="BtnSysInfo" Content="Info Sistema (IP/Host/AD)" Style="{StaticResource ModernButton}" HorizontalContentAlignment="Left" Margin="0,0,0,6"/>
+                    <Button DockPanel.Dock="Top" x:Name="BtnRefreshDash" Content="Atualizar Dashboard" Style="{StaticResource ModernButton}" HorizontalContentAlignment="Left" Margin="0,0,0,6"/>
                     <Separator DockPanel.Dock="Top" Background="#3E4451" Margin="0,4,0,8"/>
 
                     <Button DockPanel.Dock="Top" x:Name="BtnLusrmgr" Content="Usu&#225;rios Locais (lusrmgr)" Style="{StaticResource ModernButton}" HorizontalContentAlignment="Left" Margin="0,0,0,5"/>
@@ -453,8 +597,150 @@ function Show-ResultsPopup {
                 <ScrollViewer VerticalScrollBarVisibility="Auto">
                     <Grid x:Name="MainContentContainer">
 
-                        <!-- ABA 1: USUARIOS & AD -->
-                        <UniformGrid x:Name="PanelUsers" Columns="2" Visibility="Visible">
+                        <!-- ==================== ABA 0: DASHBOARD GERAL ==================== -->
+                        <StackPanel x:Name="PanelDashboard" Visibility="Visible">
+                            <!-- LINHA 1: 4 CARDS DE TELEMETRIA KPI -->
+                            <UniformGrid Columns="4">
+                                <!-- KPI CPU -->
+                                <Border Style="{StaticResource KpiCard}">
+                                    <StackPanel>
+                                        <TextBlock Text="PROCESSADOR (CPU)" FontSize="11" FontWeight="Bold" Foreground="#9CA3AF"/>
+                                        <TextBlock x:Name="DashCpuPct" Text="-- %" FontSize="22" FontWeight="Bold" Foreground="#3B82F6" Margin="0,4,0,4"/>
+                                        <ProgressBar x:Name="DashCpuBar" Height="6" Minimum="0" Maximum="100" Value="0" Background="#1E222A" Foreground="#3B82F6" BorderThickness="0"/>
+                                        <TextBlock x:Name="DashCpuSub" Text="Carregando..." FontSize="11" Foreground="#9CA3AF" Margin="0,6,0,0" TextTrimming="CharacterEllipsis"/>
+                                    </StackPanel>
+                                </Border>
+
+                                <!-- KPI RAM -->
+                                <Border Style="{StaticResource KpiCard}">
+                                    <StackPanel>
+                                        <TextBlock Text="MEM&#211;RIA RAM" FontSize="11" FontWeight="Bold" Foreground="#9CA3AF"/>
+                                        <TextBlock x:Name="DashRamPct" Text="-- / -- GB" FontSize="22" FontWeight="Bold" Foreground="#10B981" Margin="0,4,0,4"/>
+                                        <ProgressBar x:Name="DashRamBar" Height="6" Minimum="0" Maximum="100" Value="0" Background="#1E222A" Foreground="#10B981" BorderThickness="0"/>
+                                        <TextBlock x:Name="DashRamSub" Text="Carregando..." FontSize="11" Foreground="#9CA3AF" Margin="0,6,0,0"/>
+                                    </StackPanel>
+                                </Border>
+
+                                <!-- KPI DISCO C: -->
+                                <Border Style="{StaticResource KpiCard}">
+                                    <StackPanel>
+                                        <TextBlock Text="DISCO SISTEMA (C:)" FontSize="11" FontWeight="Bold" Foreground="#9CA3AF"/>
+                                        <TextBlock x:Name="DashDiskPct" Text="-- / -- GB" FontSize="22" FontWeight="Bold" Foreground="#F59E0B" Margin="0,4,0,4"/>
+                                        <ProgressBar x:Name="DashDiskBar" Height="6" Minimum="0" Maximum="100" Value="0" Background="#1E222A" Foreground="#F59E0B" BorderThickness="0"/>
+                                        <TextBlock x:Name="DashDiskSub" Text="Carregando..." FontSize="11" Foreground="#9CA3AF" Margin="0,6,0,0"/>
+                                    </StackPanel>
+                                </Border>
+
+                                <!-- KPI UPTIME & REDE -->
+                                <Border Style="{StaticResource KpiCard}">
+                                    <StackPanel>
+                                        <TextBlock Text="UPTIME &amp; CONECTIVIDADE" FontSize="11" FontWeight="Bold" Foreground="#9CA3AF"/>
+                                        <TextBlock x:Name="DashUptime" Text="--d --h --m" FontSize="22" FontWeight="Bold" Foreground="#E5E7EB" Margin="0,4,0,4"/>
+                                        <TextBlock x:Name="DashNetStatus" Text="Verificando rede..." FontSize="11.5" FontWeight="SemiBold" Foreground="#10B981" Margin="0,2,0,0"/>
+                                        <TextBlock x:Name="DashIpMain" Text="IP: --" FontSize="11" Foreground="#9CA3AF" Margin="0,4,0,0" TextTrimming="CharacterEllipsis"/>
+                                    </StackPanel>
+                                </Border>
+                            </UniformGrid>
+
+                            <!-- LINHA 2: FICHA TECNICA COMPLETA & STATUS DE SERVICOS/REDE -->
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="1.35*"/>
+                                    <ColumnDefinition Width="1*"/>
+                                </Grid.ColumnDefinitions>
+
+                                <!-- CARD ESQUERDO: IDENTIDADE & HARDWARE -->
+                                <Border Grid.Column="0" Style="{StaticResource CategoryCard}">
+                                    <StackPanel>
+                                        <TextBlock Text="Ficha T&#233;cnica &amp; Identidade do Equipamento" FontWeight="Bold" Foreground="#3B82F6" FontSize="14" Margin="0,0,0,10"/>
+
+                                        <Grid Margin="0,3">
+                                            <Grid.ColumnDefinitions><ColumnDefinition Width="145"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                                            <TextBlock Text="Hostname / Usu&#225;rio:" Foreground="#9CA3AF" FontWeight="SemiBold"/>
+                                            <TextBlock x:Name="DashHostUser" Grid.Column="1" Text="Carregando..." Foreground="#FFFFFF"/>
+                                        </Grid>
+                                        <Grid Margin="0,3">
+                                            <Grid.ColumnDefinitions><ColumnDefinition Width="145"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                                            <TextBlock Text="Dom&#237;nio / Rede:" Foreground="#9CA3AF" FontWeight="SemiBold"/>
+                                            <TextBlock x:Name="DashDomain" Grid.Column="1" Text="Carregando..." Foreground="#E5E7EB"/>
+                                        </Grid>
+                                        <Grid Margin="0,3">
+                                            <Grid.ColumnDefinitions><ColumnDefinition Width="145"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                                            <TextBlock Text="Fabricante / Modelo:" Foreground="#9CA3AF" FontWeight="SemiBold"/>
+                                            <TextBlock x:Name="DashModel" Grid.Column="1" Text="Carregando..." Foreground="#E5E7EB"/>
+                                        </Grid>
+                                        <Grid Margin="0,3">
+                                            <Grid.ColumnDefinitions><ColumnDefinition Width="145"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                                            <TextBlock Text="Placa-M&#227;e:" Foreground="#9CA3AF" FontWeight="SemiBold"/>
+                                            <TextBlock x:Name="DashBoard" Grid.Column="1" Text="Carregando..." Foreground="#E5E7EB"/>
+                                        </Grid>
+                                        <Grid Margin="0,3">
+                                            <Grid.ColumnDefinitions><ColumnDefinition Width="145"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                                            <TextBlock Text="Serial BIOS:" Foreground="#9CA3AF" FontWeight="SemiBold"/>
+                                            <TextBlock x:Name="DashSerial" Grid.Column="1" Text="Carregando..." Foreground="#FBBF24" FontFamily="Consolas"/>
+                                        </Grid>
+                                        <Grid Margin="0,3">
+                                            <Grid.ColumnDefinitions><ColumnDefinition Width="145"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                                            <TextBlock Text="Processador:" Foreground="#9CA3AF" FontWeight="SemiBold"/>
+                                            <TextBlock x:Name="DashCpuFull" Grid.Column="1" Text="Carregando..." Foreground="#E5E7EB" TextWrapping="Wrap"/>
+                                        </Grid>
+                                        <Grid Margin="0,3">
+                                            <Grid.ColumnDefinitions><ColumnDefinition Width="145"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                                            <TextBlock Text="Placa(s) de V&#237;deo:" Foreground="#9CA3AF" FontWeight="SemiBold"/>
+                                            <TextBlock x:Name="DashGpu" Grid.Column="1" Text="Carregando..." Foreground="#E5E7EB" TextWrapping="Wrap"/>
+                                        </Grid>
+                                        <Grid Margin="0,3">
+                                            <Grid.ColumnDefinitions><ColumnDefinition Width="145"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                                            <TextBlock Text="Sistema Operacional:" Foreground="#9CA3AF" FontWeight="SemiBold"/>
+                                            <TextBlock x:Name="DashOs" Grid.Column="1" Text="Carregando..." Foreground="#E5E7EB"/>
+                                        </Grid>
+                                        <Grid Margin="0,3">
+                                            <Grid.ColumnDefinitions><ColumnDefinition Width="145"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                                            <TextBlock Text="Bateria:" Foreground="#9CA3AF" FontWeight="SemiBold"/>
+                                            <TextBlock x:Name="DashBattery" Grid.Column="1" Text="Carregando..." Foreground="#E5E7EB"/>
+                                        </Grid>
+                                    </StackPanel>
+                                </Border>
+
+                                <!-- CARD DIREITO: SERVICOS CRITICOS, REDE & DISCOS -->
+                                <StackPanel Grid.Column="1">
+                                    <Border Style="{StaticResource CategoryCard}">
+                                        <StackPanel>
+                                            <TextBlock Text="Servi&#231;os Cr&#237;ticos &amp; Seguran&#231;a" FontWeight="Bold" Foreground="#3B82F6" FontSize="14" Margin="0,0,0,8"/>
+
+                                            <DockPanel Margin="0,3">
+                                                <TextBlock Text="Spooler de Impress&#227;o:" Foreground="#D1D5DB"/>
+                                                <TextBlock x:Name="DashSvcSpooler" Text="--" FontWeight="Bold" HorizontalAlignment="Right"/>
+                                            </DockPanel>
+                                            <DockPanel Margin="0,3">
+                                                <TextBlock Text="Windows Update (wuauserv):" Foreground="#D1D5DB"/>
+                                                <TextBlock x:Name="DashSvcWU" Text="--" FontWeight="Bold" HorizontalAlignment="Right"/>
+                                            </DockPanel>
+                                            <DockPanel Margin="0,3">
+                                                <TextBlock Text="Windows Defender Antiv&#237;rus:" Foreground="#D1D5DB"/>
+                                                <TextBlock x:Name="DashSvcDefender" Text="--" FontWeight="Bold" HorizontalAlignment="Right"/>
+                                            </DockPanel>
+                                            <DockPanel Margin="0,3">
+                                                <TextBlock Text="Acesso Remoto (RDP):" Foreground="#D1D5DB"/>
+                                                <TextBlock x:Name="DashSvcRdp" Text="--" FontWeight="Bold" HorizontalAlignment="Right"/>
+                                            </DockPanel>
+                                        </StackPanel>
+                                    </Border>
+
+                                    <Border Style="{StaticResource CategoryCard}">
+                                        <StackPanel>
+                                            <TextBlock Text="Resumo de Rede &amp; Discos F&#237;sicos" FontWeight="Bold" Foreground="#3B82F6" FontSize="14" Margin="0,0,0,8"/>
+                                            <TextBlock x:Name="DashNetDetails" Text="Gateway / DNS: --" Foreground="#D1D5DB" FontSize="12" TextWrapping="Wrap" Margin="0,0,0,8"/>
+                                            <TextBlock Text="Unidades F&#237;sicas (SMART):" Foreground="#9CA3AF" FontSize="11.5" FontWeight="SemiBold"/>
+                                            <TextBlock x:Name="DashSmartList" Text="Carregando..." Foreground="#10B981" FontSize="11.5" FontFamily="Consolas" TextWrapping="Wrap" Margin="0,3,0,0"/>
+                                        </StackPanel>
+                                    </Border>
+                                </StackPanel>
+                            </Grid>
+                        </StackPanel>
+
+                        <!-- ==================== ABA 1: USUARIOS & AD ==================== -->
+                        <UniformGrid x:Name="PanelUsers" Columns="2" Visibility="Collapsed">
                             <Border Style="{StaticResource CategoryCard}">
                                 <StackPanel>
                                     <TextBlock Text="Auditoria de Contas &amp; Grupos" FontWeight="Bold" Foreground="#3B82F6" FontSize="14" Margin="0,0,0,10"/>
@@ -486,7 +772,7 @@ function Show-ResultsPopup {
                             </Border>
                         </UniformGrid>
 
-                        <!-- ABA 2: REDES & CONECTIVIDADE -->
+                        <!-- ==================== ABA 2: REDES & CONECTIVIDADE ==================== -->
                         <UniformGrid x:Name="PanelNetwork" Columns="2" Visibility="Collapsed">
                             <Border Style="{StaticResource CategoryCard}">
                                 <StackPanel>
@@ -526,7 +812,7 @@ function Show-ResultsPopup {
                             </Border>
                         </UniformGrid>
 
-                        <!-- ABA 3: GESTAO DE MAQUINAS -->
+                        <!-- ==================== ABA 3: GESTAO DE MAQUINAS ==================== -->
                         <UniformGrid x:Name="PanelMachines" Columns="2" Visibility="Collapsed">
                             <Border Style="{StaticResource CategoryCard}">
                                 <StackPanel>
@@ -565,7 +851,7 @@ function Show-ResultsPopup {
                             </Border>
                         </UniformGrid>
 
-                        <!-- ABA 4: IMPRESSORAS & SPOOLER -->
+                        <!-- ==================== ABA 4: IMPRESSORAS & SPOOLER ==================== -->
                         <UniformGrid x:Name="PanelPrinters" Columns="2" Visibility="Collapsed">
                             <Border Style="{StaticResource CategoryCard}">
                                 <StackPanel>
@@ -650,7 +936,7 @@ $XAML.SelectNodes("//*[@*[contains(translate(name(.),'n','N'),'Name')]]") | ForE
 }
 
 # ==============================================================================
-# 6. TIMER DE ATUALIZACAO DA UI (DISPARA POPUP QUANDO HA RESULTADOS)
+# 7. TIMER DE ATUALIZACAO DA UI (LOG, DASHBOARD E POPUP DE RESULTADOS)
 # ==============================================================================
 $UiTimer = New-Object System.Windows.Threading.DispatcherTimer
 $UiTimer.Interval = [TimeSpan]::FromMilliseconds(150)
@@ -666,6 +952,54 @@ $UiTimer.Add_Tick({
     }
     $Controls.LblStatus.Text = "Status: $($SyncHash.StatusText) | Administrador: SIM"
 
+    # Atualiza Cards do Dashboard quando os dados chegam do Runspace
+    if ($SyncHash.DashboardReady -and $SyncHash.DashboardData) {
+        $SyncHash.DashboardReady = $false
+        $d = $SyncHash.DashboardData
+
+        $Controls.DashCpuPct.Text = "$($d.CpuLoad)%"
+        $Controls.DashCpuBar.Value = $d.CpuLoad
+        $Controls.DashCpuSub.Text = $d.CpuCores
+
+        $Controls.DashRamPct.Text = "$($d.RamUsed) / $($d.RamTotal) GB"
+        $Controls.DashRamBar.Value = $d.RamPct
+        $Controls.DashRamSub.Text = "$($d.RamPct)% em uso"
+
+        $Controls.DashDiskPct.Text = "$($d.DiskUsed) / $($d.DiskTotal) GB"
+        $Controls.DashDiskBar.Value = $d.DiskPct
+        $Controls.DashDiskSub.Text = "$($d.DiskFree) GB livres ($($d.DiskPct)% usado)"
+
+        $Controls.DashUptime.Text = $d.Uptime
+        $Controls.DashNetStatus.Text = if ($d.InternetOk) { "ONLINE (Internet OK)" } else { "OFFLINE / SEM INTERNET" }
+        $Controls.DashNetStatus.Foreground = if ($d.InternetOk) { "#10B981" } else { "#F87171" }
+        $Controls.DashIpMain.Text = "IP: $($d.IpAddress)"
+
+        $Controls.DashHostUser.Text = "$($d.Hostname)  |  $($d.User)"
+        $Controls.DashDomain.Text   = $d.Domain
+        $Controls.DashModel.Text    = $d.Model
+        $Controls.DashBoard.Text    = $d.Motherboard
+        $Controls.DashSerial.Text   = $d.BiosSerial
+        $Controls.DashCpuFull.Text  = $d.CpuName
+        $Controls.DashGpu.Text      = $d.Gpu
+        $Controls.DashOs.Text       = $d.OsCaption
+        $Controls.DashBattery.Text  = $d.Battery
+
+        $Controls.DashSvcSpooler.Text       = if ($d.SvcSpooler) { "ATIVO" } else { "PARADO" }
+        $Controls.DashSvcSpooler.Foreground = if ($d.SvcSpooler) { "#10B981" } else { "#F87171" }
+
+        $Controls.DashSvcWU.Text       = if ($d.SvcWU) { "ATIVO" } else { "PARADO" }
+        $Controls.DashSvcWU.Foreground = if ($d.SvcWU) { "#10B981" } else { "#F59E0B" }
+
+        $Controls.DashSvcDefender.Text       = if ($d.SvcDefender) { "ATIVO" } else { "DESATIVADO" }
+        $Controls.DashSvcDefender.Foreground = if ($d.SvcDefender) { "#10B981" } else { "#F87171" }
+
+        $Controls.DashSvcRdp.Text       = if ($d.SvcRdp) { "ATIVADO" } else { "DESATIVADO" }
+        $Controls.DashSvcRdp.Foreground = if ($d.SvcRdp) { "#3B82F6" } else { "#9CA3AF" }
+
+        $Controls.DashNetDetails.Text = "Gateway: $($d.Gateway)  |  DNS: $($d.Dns)"
+        $Controls.DashSmartList.Text  = $d.SmartSummary
+    }
+
     if ($SyncHash.ShowResults) {
         $SyncHash.ShowResults = $false
         Show-ResultsPopup -TabsData $SyncHash.ResultTabs
@@ -674,7 +1008,7 @@ $UiTimer.Add_Tick({
 $UiTimer.Start()
 
 # ==============================================================================
-# 7. HELPER DE DIALOGOS MODAIS DE ENTRADA
+# 8. HELPER DE DIALOGOS MODAIS DE ENTRADA
 # ==============================================================================
 function Show-InputDialog {
     param([string]$Title, [array]$Fields)
@@ -767,32 +1101,22 @@ function Show-InputDialog {
 }
 
 # ==============================================================================
-# 8. NAVEGACAO ENTRE ABAS E FILTRO DE PESQUISA
+# 9. NAVEGACAO ENTRE ABAS E FILTRO DE PESQUISA
 # ==============================================================================
-$Controls.TabUsers.Add_Checked({
-    $Controls.PanelUsers.Visibility = "Visible"
-    $Controls.PanelNetwork.Visibility = "Collapsed"
-    $Controls.PanelMachines.Visibility = "Collapsed"
-    $Controls.PanelPrinters.Visibility = "Collapsed"
-})
-$Controls.TabNetwork.Add_Checked({
-    $Controls.PanelUsers.Visibility = "Collapsed"
-    $Controls.PanelNetwork.Visibility = "Visible"
-    $Controls.PanelMachines.Visibility = "Collapsed"
-    $Controls.PanelPrinters.Visibility = "Collapsed"
-})
-$Controls.TabMachines.Add_Checked({
-    $Controls.PanelUsers.Visibility = "Collapsed"
-    $Controls.PanelNetwork.Visibility = "Collapsed"
-    $Controls.PanelMachines.Visibility = "Visible"
-    $Controls.PanelPrinters.Visibility = "Collapsed"
-})
-$Controls.TabPrinters.Add_Checked({
-    $Controls.PanelUsers.Visibility = "Collapsed"
-    $Controls.PanelNetwork.Visibility = "Collapsed"
-    $Controls.PanelMachines.Visibility = "Collapsed"
-    $Controls.PanelPrinters.Visibility = "Visible"
-})
+function Set-ActiveTab {
+    param([string]$ActivePanel)
+    $Controls.PanelDashboard.Visibility = if ($ActivePanel -eq "Dashboard") { "Visible" } else { "Collapsed" }
+    $Controls.PanelUsers.Visibility     = if ($ActivePanel -eq "Users")     { "Visible" } else { "Collapsed" }
+    $Controls.PanelNetwork.Visibility   = if ($ActivePanel -eq "Network")   { "Visible" } else { "Collapsed" }
+    $Controls.PanelMachines.Visibility  = if ($ActivePanel -eq "Machines")  { "Visible" } else { "Collapsed" }
+    $Controls.PanelPrinters.Visibility  = if ($ActivePanel -eq "Printers")  { "Visible" } else { "Collapsed" }
+}
+
+$Controls.TabDashboard.Add_Checked({ Set-ActiveTab "Dashboard" })
+$Controls.TabUsers.Add_Checked({ Set-ActiveTab "Users" })
+$Controls.TabNetwork.Add_Checked({ Set-ActiveTab "Network" })
+$Controls.TabMachines.Add_Checked({ Set-ActiveTab "Machines" })
+$Controls.TabPrinters.Add_Checked({ Set-ActiveTab "Printers" })
 
 function Find-VisualChildren {
     param([System.Windows.DependencyObject]$Parent)
@@ -821,8 +1145,9 @@ $Controls.TxtSearch.Add_TextChanged({
 })
 
 # ==============================================================================
-# 9. EVENTOS DO PAINEL LATERAL E CONSOLE
+# 10. EVENTOS DO PAINEL LATERAL E CONSOLE
 # ==============================================================================
+$Controls.BtnRefreshDash.Add_Click({ Update-DashboardAsync })
 $Controls.BtnClearLog.Add_Click({ $Controls.TxtConsole.Clear() })
 
 $Controls.BtnLastResults.Add_Click({
@@ -851,23 +1176,6 @@ $Controls.BtnPrintMgmt.Add_Click({ Write-AppLog "Abrindo printmanagement.msc" "C
 $Controls.BtnGpedit.Add_Click({ Write-AppLog "Abrindo gpedit.msc" "CMD"; Start-Process "gpedit.msc" })
 $Controls.BtnNetplwiz.Add_Click({ Write-AppLog "Abrindo netplwiz.exe" "CMD"; Start-Process "netplwiz.exe" })
 
-$Controls.BtnSysInfo.Add_Click({
-    Invoke-AsyncTask -TaskName "Informacoes Rapidas do Sistema" -ScriptBlock {
-        Write-TaskLog "Consultando Win32_ComputerSystem e Win32_NetworkAdapterConfiguration..." "CMD"
-        $cs = Get-CimInstance Win32_ComputerSystem
-        $ips = (Get-CimInstance Win32_NetworkAdapterConfiguration -Filter "IPEnabled=True" | ForEach-Object { $_.IPAddress }) -join ", "
-        $report = @"
-Hostname: $($env:COMPUTERNAME)
-Usuario Atual: $($env:USERNAME)
-Dominio / Workgroup: $($cs.Domain)
-Ingressado no Dominio: $($cs.PartOfDomain)
-Fabricante / Modelo: $($cs.Manufacturer) - $($cs.Model)
-Enderecos IP Ativos: $ips
-"@
-        Add-TaskResult -TabTitle "Info Sistema" -Content $report
-    }
-})
-
 $Controls.BtnClearSelection.Add_Click({
     Find-VisualChildren -Parent $Controls.MainContentContainer | Where-Object { $_ -is [System.Windows.Controls.CheckBox] } | ForEach-Object {
         $_.IsChecked = $false
@@ -875,7 +1183,7 @@ $Controls.BtnClearSelection.Add_Click({
 })
 
 # ==============================================================================
-# 10. EVENTOS DE BOTOES DIRETOS
+# 11. EVENTOS DE BOTOES DIRETOS
 # ==============================================================================
 
 # --- ABA 1: USUARIOS ---
@@ -1093,7 +1401,7 @@ $Controls.BtnTestPrinterNet.Add_Click({
 })
 
 # ==============================================================================
-# 11. EXECUCAO EM LOTE DAS CHECKBOXES SELECIONADAS
+# 12. EXECUCAO EM LOTE DAS CHECKBOXES SELECIONADAS
 # ==============================================================================
 $Controls.BtnRunSelected.Add_Click({
     $selectedTags = Find-VisualChildren -Parent $Controls.MainContentContainer |
@@ -1128,7 +1436,7 @@ $Controls.BtnRunSelected.Add_Click({
             }
 
             switch ($tag) {
-                # ABA 1: USUARIOS & AD (GERAM ABAS NO POPUP)
+                # ABA 1
                 "Usr_ListLocal" {
                     Write-TaskLog "Consultando Win32_UserAccount (LocalAccount=True)..." "CMD"
                     $out = Get-CimInstance Win32_UserAccount -Filter "LocalAccount=True" |
@@ -1151,7 +1459,7 @@ $Controls.BtnRunSelected.Add_Click({
                     Invoke-NativeCmd -CmdLine "gpresult /r" -ResultTabTitle "GPResult (GPOs)"
                 }
 
-                # ABA 2: REDES
+                # ABA 2
                 "Net_Ipconfig"     { Invoke-NativeCmd -CmdLine "ipconfig /all" -ResultTabTitle "IPConfig /all" }
                 "Net_Arp"          { Invoke-NativeCmd -CmdLine "arp -a" -ResultTabTitle "Tabela ARP" }
                 "Net_Route"        { Invoke-NativeCmd -CmdLine "route print" -ResultTabTitle "Tabela de Rotas" }
@@ -1167,7 +1475,7 @@ $Controls.BtnRunSelected.Add_Click({
                     Add-TaskResult -TabTitle "Teste Internet" -Content "Ping 8.8.8.8 (Google DNS): $g`r`nPing 1.1.1.1 (Cloudflare DNS): $c"
                 }
 
-                # ABA 3: GESTAO DE MAQUINAS
+                # ABA 3
                 "Mch_Inventory" {
                     Write-TaskLog "Coletando inventario de hardware via CIM..." "CMD"
                     $cpu = (Get-CimInstance Win32_Processor).Name
@@ -1219,7 +1527,7 @@ Tempo Ligado (Uptime): $($uptime.Days) dias, $($uptime.Hours) horas, $($uptime.M
                 "Mch_Sfc"  { Invoke-NativeCmd -CmdLine "sfc /scannow" -ResultTabTitle "SFC Scannow" }
                 "Mch_Dism" { Invoke-NativeCmd -CmdLine "DISM /Online /Cleanup-Image /RestoreHealth" -ResultTabTitle "DISM RestoreHealth" }
 
-                # ABA 4: IMPRESSORAS & SPOOLER
+                # ABA 4
                 "Prt_ListAll" {
                     Write-TaskLog "Consultando Win32_Printer e Win32_TCPIPPrinterPort..." "CMD"
                     $prts = Get-CimInstance Win32_Printer | Select-Object Name, DriverName, PortName, WorkOffline | Format-Table -AutoSize | Out-String
@@ -1248,8 +1556,11 @@ Tempo Ligado (Uptime): $($uptime.Days) dias, $($uptime.Hours) horas, $($uptime.M
     }
 })
 
+# ==============================================================================
+# 13. INICIALIZACAO
+# ==============================================================================
 Write-AppLog "IT-AdminUtil inicializado com privilegios de Administrador." "OK"
-Write-AppLog "Console configurado para auditoria de comandos e erros. Resultados detalhados abrirao em abas popup."
+$Window.Add_Loaded({ Update-DashboardAsync })
 
 [void]$Window.ShowDialog()
 $UiTimer.Stop()
