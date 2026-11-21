@@ -2,10 +2,9 @@
 .SYNOPSIS
     IT-AdminUtil - Console Portatil de Administracao de TI (Estilo WinUtil)
 .DESCRIPTION
-    Utilitario completo em PowerShell + WPF com Dashboard de Telemetria em tempo real,
-    gestao de Usuarios/AD, Redes, Manutencao de Maquinas, Impressoras/Spooler e Winget.
-    Console inferior dedicado a auditoria de comandos/erros e janela popup com abas
-    para exibicao de relatorios detalhados.
+    Utilitario completo em PowerShell + WPF com Dashboard Avancado (Telemetria,
+    Sensores Termicos CPU/NVMe, Saude Real de Bateria/SMART, Slots RAM, Estabilidade),
+    Console Ocultavel e Popup com Abas para Relatorios.
 #>
 
 # ==============================================================================
@@ -32,18 +31,20 @@ Add-Type -AssemblyName System.Windows.Forms
 # 2. ESTADO SINCRONIZADO ENTRE UI E RUNSPACES (THREAD-SAFE)
 # ==============================================================================
 $SyncHash = [hashtable]::Synchronized(@{
-    LogQueue      = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
-    ResultTabs    = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
-    ShowResults   = $false
-    IsBusy        = $false
-    StatusText    = "Pronto"
-    DashboardData = $null
+    LogQueue       = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
+    ResultTabs     = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
+    ShowResults    = $false
+    IsBusy         = $false
+    StatusText     = "Pronto"
+    DashboardData  = $null
     DashboardReady = $false
+    ErrorCount     = 0
 })
 
 function global:Write-AppLog {
     param([string]$Message, [string]$Level = "INFO")
     $timestamp = (Get-Date).ToString("HH:mm:ss")
+    if ($Level -eq "ERR") { $SyncHash.ErrorCount++ }
     $prefix = switch ($Level) {
         "ERR"   { "[ERRO]" }
         "WARN"  { "[AVISO]" }
@@ -55,7 +56,7 @@ function global:Write-AppLog {
 }
 
 # ==============================================================================
-# 3. MOTOR DE EXECUCAO ASSINCRONA (RUNSPACES COM ESCOPO E MODULOS INJETADOS)
+# 3. MOTOR DE EXECUCAO ASSINCRONA
 # ==============================================================================
 function global:Invoke-AsyncTask {
     param(
@@ -97,6 +98,7 @@ function global:Invoke-AsyncTask {
 
         function global:Write-TaskLog {
             param([string]$Msg, [string]$Lvl = "INFO")
+            if ($Lvl -eq "ERR") { $Sync.ErrorCount++ }
             $ts = (Get-Date).ToString("HH:mm:ss")
             $Sync.LogQueue.Enqueue("[$ts] [$Lvl] $Msg")
         }
@@ -134,6 +136,7 @@ function global:Invoke-AsyncTask {
             $proc.WaitForExit()
 
             if ($proc.ExitCode -ne 0 -and -not [string]::IsNullOrWhiteSpace($err)) {
+                $Sync.ErrorCount++
                 $Sync.LogQueue.Enqueue("[$ts] [ERRO] $($err.Trim())")
             }
 
@@ -154,6 +157,7 @@ function global:Invoke-AsyncTask {
                 $Sync.ShowResults = $true
             }
         } catch {
+            $Sync.ErrorCount++
             $Sync.LogQueue.Enqueue("[" + (Get-Date).ToString("HH:mm:ss") + "] [ERRO] Falha em '$TName': $($_.Exception.Message)")
         } finally {
             $Sync.IsBusy = $false
@@ -166,11 +170,11 @@ function global:Invoke-AsyncTask {
 }
 
 # ==============================================================================
-# 4. COLETA ASSINCRONA DEDICADA DO DASHBOARD INICIAL
+# 4. COLETA ASSINCRONA DO DASHBOARD (COM SENSORES TERMICOS E TELEMETRIA AVANCADA)
 # ==============================================================================
 function global:Update-DashboardAsync {
-    $SyncHash.StatusText = "Coletando telemetria do Dashboard..."
-    Write-AppLog "Atualizando telemetria geral da maquina no Dashboard..." "CMD"
+    $SyncHash.StatusText = "Coletando telemetria e sensores..."
+    Write-AppLog "Atualizando telemetria completa e sensores termicos..." "CMD"
 
     $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
     $rs = [runspacefactory]::CreateRunspace($iss)
@@ -185,6 +189,7 @@ function global:Update-DashboardAsync {
         param($Sync)
         Import-Module Microsoft.PowerShell.Management -ErrorAction SilentlyContinue
         Import-Module CimCmdlets -ErrorAction SilentlyContinue
+        Import-Module Storage -ErrorAction SilentlyContinue
 
         try {
             $cs    = Get-CimInstance Win32_ComputerSystem
@@ -193,59 +198,140 @@ function global:Update-DashboardAsync {
             $bios  = Get-CimInstance Win32_BIOS
             $board = Get-CimInstance Win32_BaseBoard
             $gpus  = (Get-CimInstance Win32_VideoController).Name -join " | "
-            $bat   = Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue
 
-            # RAM
+            # --- 1. SENSOR TERMICO CPU / ACPI ---
+            $cpuTempC = $null
+            try {
+                $tz = Get-CimInstance -Namespace "root\wmi" -ClassName MSAcpi_ThermalZoneTemperature -ErrorAction Stop |
+                      Sort-Object CurrentTemperature -Descending | Select-Object -First 1
+                if ($tz -and $tz.CurrentTemperature -gt 0) {
+                    $cpuTempC = [math]::Round(($tz.CurrentTemperature / 10) - 273.15, 1)
+                }
+            } catch {
+                try {
+                    $tz2 = Get-CimInstance Win32_PerfFormattedData_Counters_ThermalZoneInformation -ErrorAction Stop |
+                           Sort-Object HighPrecisionTemperature -Descending | Select-Object -First 1
+                    if ($tz2 -and $tz2.HighPrecisionTemperature -gt 0) {
+                        $cpuTempC = [math]::Round(($tz2.HighPrecisionTemperature / 10) - 273.15, 1)
+                    }
+                } catch {}
+            }
+            $cpuTempStr = if ($cpuTempC) { "$cpuTempC °C" } else { "N/D (Bloqueado BIOS)" }
+
+            # --- 2. RAM E SLOTS FISICOS ---
             $totalRamGB = [math]::Round($cs.TotalPhysicalMemory / 1GB, 1)
             $freeRamGB  = [math]::Round(($os.FreePhysicalMemory * 1KB) / 1GB, 1)
             $usedRamGB  = [math]::Round($totalRamGB - $freeRamGB, 1)
             $ramPct     = if ($totalRamGB -gt 0) { [math]::Round(($usedRamGB / $totalRamGB) * 100, 0) } else { 0 }
 
-            # Disco C:
-            $sysDrive   = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'" -ErrorAction SilentlyContinue
-            $diskTotal  = if ($sysDrive) { [math]::Round($sysDrive.Size / 1GB, 0) } else { 0 }
-            $diskFree   = if ($sysDrive) { [math]::Round($sysDrive.FreeSpace / 1GB, 0) } else { 0 }
-            $diskUsed   = $diskTotal - $diskFree
-            $diskPct    = if ($diskTotal -gt 0) { [math]::Round(($diskUsed / $diskTotal) * 100, 0) } else { 0 }
+            $ramSlotsInfo = "N/D"
+            try {
+                $sticks = Get-CimInstance Win32_PhysicalMemory -ErrorAction Stop
+                $slotCount = ($sticks | Measure-Object).Count
+                $speedMhz = ($sticks | Select-Object -First 1).ConfiguredClockSpeed
+                if (-not $speedMhz) { $speedMhz = ($sticks | Select-Object -First 1).Speed }
+                $ramSlotsInfo = "$slotCount pente(s) @ ${speedMhz} MHz"
+            } catch {}
 
-            # Discos SMART
-            $smartList = (Get-CimInstance Win32_DiskDrive | ForEach-Object {
-                "$($_.Model) [$([math]::Round($_.Size/1GB,0))GB - $($_.Status)]"
-            }) -join "`n"
+            # --- 3. DISCO C: E SENSORES SMART/TEMPERATURA NVMe ---
+            $sysDrive  = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'" -ErrorAction SilentlyContinue
+            $diskTotal = if ($sysDrive) { [math]::Round($sysDrive.Size / 1GB, 0) } else { 0 }
+            $diskFree  = if ($sysDrive) { [math]::Round($sysDrive.FreeSpace / 1GB, 0) } else { 0 }
+            $diskUsed  = $diskTotal - $diskFree
+            $diskPct   = if ($diskTotal -gt 0) { [math]::Round(($diskUsed / $diskTotal) * 100, 0) } else { 0 }
 
-            # Rede
+            $smartLines = @()
+            try {
+                $physDisks = Get-PhysicalDisk -ErrorAction Stop
+                foreach ($pd in $physDisks) {
+                    $rel = $pd | Get-StorageReliabilityCounter -ErrorAction SilentlyContinue
+                    $gb = [math]::Round($pd.Size / 1GB, 0)
+                    $tempTxt = if ($rel.Temperature -and $rel.Temperature -gt 0) { "$($rel.Temperature)°C" } else { "--°C" }
+                    $wearTxt = if ($null -ne $rel.Wear) { "Saude: $(100 - $rel.Wear)%" } else { $pd.HealthStatus }
+                    $hrsTxt  = if ($rel.PowerOnHours) { " | $($rel.PowerOnHours)h" } else { "" }
+                    $smartLines += "$($pd.FriendlyName) [${gb}GB] -> $tempTxt | $wearTxt$hrsTxt"
+                }
+            } catch {
+                Get-CimInstance Win32_DiskDrive | ForEach-Object {
+                    $smartLines += "$($_.Model) [$([math]::Round($_.Size/1GB,0))GB - $($_.Status)]"
+                }
+            }
+            $smartSummary = $smartLines -join "`n"
+
+            # --- 4. BATERIA (CARGA + SAUDE REAL DE FABRICA) ---
+            $bat = Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue
+            $batStr = "N/A (Desktop / Sem Bateria)"
+            if ($bat) {
+                $charge = $bat.EstimatedChargeRemaining
+                try {
+                    $full = (Get-CimInstance -Namespace "root\wmi" -ClassName BatteryFullChargedCapacity -ErrorAction Stop | Select-Object -First 1).FullChargedCapacity
+                    $des  = (Get-CimInstance -Namespace "root\wmi" -ClassName BatteryStaticData -ErrorAction Stop | Select-Object -First 1).DesignedCapacity
+                    if ($full -gt 0 -and $des -gt 0) {
+                        $healthPct = [math]::Round(($full / $des) * 100, 1)
+                        $batStr = "Carga: ${charge}% | Saude Real: ${healthPct}% (${full}/${des} mWh)"
+                    } else {
+                        $batStr = "Carga: ${charge}% ($($bat.Status))"
+                    }
+                } catch {
+                    $batStr = "Carga: ${charge}% ($($bat.Status))"
+                }
+            }
+
+            # --- 5. REDE & INTERNET ---
             $nicCfg = Get-CimInstance Win32_NetworkAdapterConfiguration -Filter "IPEnabled=True" | Select-Object -First 1
             $ipAddr = if ($nicCfg.IPAddress) { ($nicCfg.IPAddress | Where-Object { $_ -match '^\d+\.' }) -join ", " } else { "Sem IP" }
             $gwAddr = if ($nicCfg.DefaultIPGateway) { $nicCfg.DefaultIPGateway -join ", " } else { "N/D" }
             $dnsAddr = if ($nicCfg.DNSServerSearchOrder) { $nicCfg.DNSServerSearchOrder -join ", " } else { "N/D" }
             $netOnline = Test-Connection 8.8.8.8 -Count 1 -Quiet
 
-            # Uptime
+            # --- 6. UPTIME & ESTABILIDADE (BSOD / EVENTOS 41 E 1001 NOS ULTIMOS 30 DIAS) ---
             $up = (Get-Date) - $os.LastBootUpTime
             $uptimeStr = "$($up.Days)d $($up.Hours)h $($up.Minutes)m"
 
-            # Servicos Criticos
-            $spooler = (Get-Service Spooler -ErrorAction SilentlyContinue).Status -eq "Running"
+            $crashSummary = "0 falhas criticas (30d)"
+            try {
+                $since = (Get-Date).AddDays(-30)
+                $evts = Get-WinEvent -FilterHashtable @{LogName='System'; Id=41,1001; StartTime=$since} -ErrorAction SilentlyContinue
+                $c41 = ($evts | Where-Object { $_.Id -eq 41 } | Measure-Object).Count
+                $c1001 = ($evts | Where-Object { $_.Id -eq 1001 } | Measure-Object).Count
+                if ($c41 -gt 0 -or $c1001 -gt 0) {
+                    $crashSummary = "$c1001 BSOD / $c41 Deslig. Forcados (30d)"
+                }
+            } catch {}
+
+            # --- 7. SERVICOS & SEGURANCA ---
+            $spooler  = (Get-Service Spooler -ErrorAction SilentlyContinue).Status -eq "Running"
             $wuauserv = (Get-Service wuauserv -ErrorAction SilentlyContinue).Status -eq "Running"
             $defender = (Get-Service WinDefend -ErrorAction SilentlyContinue).Status -eq "Running"
-            $rdpVal = (Get-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -ErrorAction SilentlyContinue).fDenyTSConnections
+            $rdpVal   = (Get-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -ErrorAction SilentlyContinue).fDenyTSConnections
             $rdpEnabled = ($rdpVal -eq 0)
 
-            # Bateria
-            $batStr = if ($bat) { "$($bat.EstimatedChargeRemaining)% ($($bat.Status))" } else { "N/A (Desktop / Sem Bateria)" }
+            $bitlockerStatus = "Desativado"
+            try {
+                $bl = Get-CimInstance -Namespace "Root\CIMV2\Security\MicrosoftVolumeEncryption" -ClassName Win32_EncryptableVolume -Filter "DriveLetter='C:'" -ErrorAction Stop
+                if ($bl.ProtectionStatus -eq 1) { $bitlockerStatus = "Ativo (Protegido)" }
+            } catch {}
+
+            # --- 8. TOP 3 PROCESSOS POR MEMORIA ---
+            $topProcs = (Get-Process | Sort-Object WorkingSet64 -Descending | Select-Object -First 3 | ForEach-Object {
+                "$($_.ProcessName) ($([math]::Round($_.WorkingSet64/1MB,0)) MB)"
+            }) -join "  |  "
 
             $Sync.DashboardData = @{
                 CpuLoad      = [int]$cpu.LoadPercentage
+                CpuTemp      = $cpuTempC
+                CpuTempStr   = $cpuTempStr
                 CpuName      = $cpu.Name.Trim()
-                CpuCores     = "$($cpu.NumberOfCores) Cores / $($cpu.NumberOfLogicalProcessors) Threads"
+                CpuCores     = "$($cpu.NumberOfCores)C/$($cpu.NumberOfLogicalProcessors)T"
                 RamUsed      = $usedRamGB
                 RamTotal     = $totalRamGB
                 RamPct       = $ramPct
+                RamSlots     = $ramSlotsInfo
                 DiskUsed     = $diskUsed
                 DiskTotal    = $diskTotal
                 DiskFree     = $diskFree
                 DiskPct      = $diskPct
-                SmartSummary = $smartList
+                SmartSummary = $smartSummary
                 Hostname     = $env:COMPUTERNAME
                 User         = $env:USERNAME
                 Domain       = "$($cs.Domain) ($(if($cs.PartOfDomain){'Dominio AD'}else{'Workgroup'}))"
@@ -256,6 +342,9 @@ function global:Update-DashboardAsync {
                 OsCaption    = "$($os.Caption) (Build $($os.BuildNumber))"
                 Uptime       = $uptimeStr
                 Battery      = $batStr
+                CrashSummary = $crashSummary
+                BitLocker    = $bitlockerStatus
+                TopProcs     = $topProcs
                 IpAddress    = $ipAddr
                 Gateway      = $gwAddr
                 Dns          = $dnsAddr
@@ -266,8 +355,9 @@ function global:Update-DashboardAsync {
                 SvcRdp       = $rdpEnabled
             }
             $Sync.DashboardReady = $true
-            $Sync.LogQueue.Enqueue("[" + (Get-Date).ToString("HH:mm:ss") + "] [OK] Telemetria do Dashboard atualizada.")
+            $Sync.LogQueue.Enqueue("[" + (Get-Date).ToString("HH:mm:ss") + "] [OK] Telemetria e sensores atualizados.")
         } catch {
+            $Sync.ErrorCount++
             $Sync.LogQueue.Enqueue("[" + (Get-Date).ToString("HH:mm:ss") + "] [ERRO] Falha ao carregar Dashboard: $($_.Exception.Message)")
         } finally {
             $Sync.StatusText = "Pronto"
@@ -422,13 +512,13 @@ function Show-ResultsPopup {
 }
 
 # ==============================================================================
-# 6. INTERFACE GRAFICA WPF PRINCIPAL (COM ABA 0: DASHBOARD GERAL)
+# 6. INTERFACE GRAFICA WPF PRINCIPAL (CONSOLE OCULTAVEL + SENSORES TERMICOS)
 # ==============================================================================
 [xml]$XAML = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="IT-AdminUtil | Console Port&#225;til de Infraestrutura Windows"
-        Height="780" Width="1240" MinHeight="660" MinWidth="1020"
+        Height="760" Width="1250" MinHeight="640" MinWidth="1020"
         WindowStartupLocation="CenterScreen" Background="#1E222A" Foreground="#ABB2BF"
         FontFamily="Segoe UI">
 
@@ -535,7 +625,7 @@ function Show-ResultsPopup {
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
-            <RowDefinition Height="165"/>
+            <RowDefinition x:Name="ConsoleRowDef" Height="0"/>
             <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
 
@@ -566,7 +656,7 @@ function Show-ResultsPopup {
         </Border>
 
         <!-- CORPO PRINCIPAL -->
-        <Grid Grid.Row="1" Margin="0,0,0,10">
+        <Grid Grid.Row="1" Margin="0,0,0,8">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="250"/>
                 <ColumnDefinition Width="*"/>
@@ -601,23 +691,26 @@ function Show-ResultsPopup {
                         <StackPanel x:Name="PanelDashboard" Visibility="Visible">
                             <!-- LINHA 1: 4 CARDS DE TELEMETRIA KPI -->
                             <UniformGrid Columns="4">
-                                <!-- KPI CPU -->
+                                <!-- KPI CPU + TEMPERATURA -->
                                 <Border Style="{StaticResource KpiCard}">
                                     <StackPanel>
-                                        <TextBlock Text="PROCESSADOR (CPU)" FontSize="11" FontWeight="Bold" Foreground="#9CA3AF"/>
+                                        <DockPanel>
+                                            <TextBlock Text="CPU &amp; TEMP" FontSize="11" FontWeight="Bold" Foreground="#9CA3AF"/>
+                                            <TextBlock x:Name="DashCpuTemp" Text="-- &#176;C" FontSize="12" FontWeight="Bold" Foreground="#10B981" HorizontalAlignment="Right"/>
+                                        </DockPanel>
                                         <TextBlock x:Name="DashCpuPct" Text="-- %" FontSize="22" FontWeight="Bold" Foreground="#3B82F6" Margin="0,4,0,4"/>
                                         <ProgressBar x:Name="DashCpuBar" Height="6" Minimum="0" Maximum="100" Value="0" Background="#1E222A" Foreground="#3B82F6" BorderThickness="0"/>
                                         <TextBlock x:Name="DashCpuSub" Text="Carregando..." FontSize="11" Foreground="#9CA3AF" Margin="0,6,0,0" TextTrimming="CharacterEllipsis"/>
                                     </StackPanel>
                                 </Border>
 
-                                <!-- KPI RAM -->
+                                <!-- KPI RAM + SLOTS -->
                                 <Border Style="{StaticResource KpiCard}">
                                     <StackPanel>
                                         <TextBlock Text="MEM&#211;RIA RAM" FontSize="11" FontWeight="Bold" Foreground="#9CA3AF"/>
                                         <TextBlock x:Name="DashRamPct" Text="-- / -- GB" FontSize="22" FontWeight="Bold" Foreground="#10B981" Margin="0,4,0,4"/>
                                         <ProgressBar x:Name="DashRamBar" Height="6" Minimum="0" Maximum="100" Value="0" Background="#1E222A" Foreground="#10B981" BorderThickness="0"/>
-                                        <TextBlock x:Name="DashRamSub" Text="Carregando..." FontSize="11" Foreground="#9CA3AF" Margin="0,6,0,0"/>
+                                        <TextBlock x:Name="DashRamSub" Text="Carregando..." FontSize="11" Foreground="#9CA3AF" Margin="0,6,0,0" TextTrimming="CharacterEllipsis"/>
                                     </StackPanel>
                                 </Border>
 
@@ -642,10 +735,10 @@ function Show-ResultsPopup {
                                 </Border>
                             </UniformGrid>
 
-                            <!-- LINHA 2: FICHA TECNICA COMPLETA & STATUS DE SERVICOS/REDE -->
+                            <!-- LINHA 2: FICHA TECNICA COMPLETA & SENSORES/SERVICOS -->
                             <Grid>
                                 <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="1.35*"/>
+                                    <ColumnDefinition Width="1.25*"/>
                                     <ColumnDefinition Width="1*"/>
                                 </Grid.ColumnDefinitions>
 
@@ -696,43 +789,55 @@ function Show-ResultsPopup {
                                         </Grid>
                                         <Grid Margin="0,3">
                                             <Grid.ColumnDefinitions><ColumnDefinition Width="145"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-                                            <TextBlock Text="Bateria:" Foreground="#9CA3AF" FontWeight="SemiBold"/>
+                                            <TextBlock Text="Bateria / Sa&#250;de:" Foreground="#9CA3AF" FontWeight="SemiBold"/>
                                             <TextBlock x:Name="DashBattery" Grid.Column="1" Text="Carregando..." Foreground="#E5E7EB"/>
+                                        </Grid>
+                                        <Grid Margin="0,3">
+                                            <Grid.ColumnDefinitions><ColumnDefinition Width="145"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                                            <TextBlock Text="Estabilidade (30d):" Foreground="#9CA3AF" FontWeight="SemiBold"/>
+                                            <TextBlock x:Name="DashCrash" Grid.Column="1" Text="Carregando..." Foreground="#10B981"/>
                                         </Grid>
                                     </StackPanel>
                                 </Border>
 
-                                <!-- CARD DIREITO: SERVICOS CRITICOS, REDE & DISCOS -->
+                                <!-- CARD DIREITO: SERVICOS CRITICOS, SENSORES SMART & TOP PROCESSOS -->
                                 <StackPanel Grid.Column="1">
                                     <Border Style="{StaticResource CategoryCard}">
                                         <StackPanel>
                                             <TextBlock Text="Servi&#231;os Cr&#237;ticos &amp; Seguran&#231;a" FontWeight="Bold" Foreground="#3B82F6" FontSize="14" Margin="0,0,0,8"/>
 
-                                            <DockPanel Margin="0,3">
+                                            <DockPanel Margin="0,2">
                                                 <TextBlock Text="Spooler de Impress&#227;o:" Foreground="#D1D5DB"/>
                                                 <TextBlock x:Name="DashSvcSpooler" Text="--" FontWeight="Bold" HorizontalAlignment="Right"/>
                                             </DockPanel>
-                                            <DockPanel Margin="0,3">
+                                            <DockPanel Margin="0,2">
                                                 <TextBlock Text="Windows Update (wuauserv):" Foreground="#D1D5DB"/>
                                                 <TextBlock x:Name="DashSvcWU" Text="--" FontWeight="Bold" HorizontalAlignment="Right"/>
                                             </DockPanel>
-                                            <DockPanel Margin="0,3">
+                                            <DockPanel Margin="0,2">
                                                 <TextBlock Text="Windows Defender Antiv&#237;rus:" Foreground="#D1D5DB"/>
                                                 <TextBlock x:Name="DashSvcDefender" Text="--" FontWeight="Bold" HorizontalAlignment="Right"/>
                                             </DockPanel>
-                                            <DockPanel Margin="0,3">
+                                            <DockPanel Margin="0,2">
                                                 <TextBlock Text="Acesso Remoto (RDP):" Foreground="#D1D5DB"/>
                                                 <TextBlock x:Name="DashSvcRdp" Text="--" FontWeight="Bold" HorizontalAlignment="Right"/>
+                                            </DockPanel>
+                                            <DockPanel Margin="0,2">
+                                                <TextBlock Text="Criptografia BitLocker (C:):" Foreground="#D1D5DB"/>
+                                                <TextBlock x:Name="DashBitLocker" Text="--" FontWeight="Bold" Foreground="#9CA3AF" HorizontalAlignment="Right"/>
                                             </DockPanel>
                                         </StackPanel>
                                     </Border>
 
                                     <Border Style="{StaticResource CategoryCard}">
                                         <StackPanel>
-                                            <TextBlock Text="Resumo de Rede &amp; Discos F&#237;sicos" FontWeight="Bold" Foreground="#3B82F6" FontSize="14" Margin="0,0,0,8"/>
-                                            <TextBlock x:Name="DashNetDetails" Text="Gateway / DNS: --" Foreground="#D1D5DB" FontSize="12" TextWrapping="Wrap" Margin="0,0,0,8"/>
-                                            <TextBlock Text="Unidades F&#237;sicas (SMART):" Foreground="#9CA3AF" FontSize="11.5" FontWeight="SemiBold"/>
-                                            <TextBlock x:Name="DashSmartList" Text="Carregando..." Foreground="#10B981" FontSize="11.5" FontFamily="Consolas" TextWrapping="Wrap" Margin="0,3,0,0"/>
+                                            <TextBlock Text="Sensores SMART / Temperatura NVMe" FontWeight="Bold" Foreground="#3B82F6" FontSize="14" Margin="0,0,0,6"/>
+                                            <TextBlock x:Name="DashSmartList" Text="Carregando sensores..." Foreground="#10B981" FontSize="11.5" FontFamily="Consolas" TextWrapping="Wrap" Margin="0,0,0,8"/>
+
+                                            <TextBlock Text="Top Processos (Mem&#243;ria):" Foreground="#9CA3AF" FontSize="11.5" FontWeight="SemiBold"/>
+                                            <TextBlock x:Name="DashTopProcs" Text="--" Foreground="#D1D5DB" FontSize="11" TextWrapping="Wrap" Margin="0,2,0,6"/>
+
+                                            <TextBlock x:Name="DashNetDetails" Text="Gateway / DNS: --" Foreground="#9CA3AF" FontSize="11" TextWrapping="Wrap"/>
                                         </StackPanel>
                                     </Border>
                                 </StackPanel>
@@ -893,8 +998,8 @@ function Show-ResultsPopup {
             </Border>
         </Grid>
 
-        <!-- CONSOLE INTEGRADO (APENAS AUDITORIA DE COMANDOS E ERROS) -->
-        <Border Grid.Row="2" Background="#161920" BorderBrush="#3E4451" BorderThickness="1" CornerRadius="8" Padding="10">
+        <!-- CONSOLE INTEGRADO (OCULTO POR PADRAO - ATIVADO VIA TOGGLE NO RODAPE) -->
+        <Border x:Name="ConsolePanel" Grid.Row="2" Background="#161920" BorderBrush="#3E4451" BorderThickness="1" CornerRadius="8" Padding="10" Margin="0,0,0,8" Visibility="Collapsed">
             <Grid>
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto"/>
@@ -904,7 +1009,6 @@ function Show-ResultsPopup {
                 <DockPanel Grid.Row="0" Margin="0,0,0,6">
                     <TextBlock Text="CONSOLE DE AUDITORIA (COMANDOS ACIONADOS &amp; ERROS)" FontWeight="Bold" Foreground="#9CA3AF" FontSize="11.5" VerticalAlignment="Center"/>
                     <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
-                        <Button x:Name="BtnLastResults" Content="Ver &#218;ltimos Resultados" Style="{StaticResource ModernButton}" Padding="10,4" FontSize="11.5" Margin="0,0,6,0"/>
                         <Button x:Name="BtnClearLog" Content="Limpar Log" Style="{StaticResource ModernButton}" Padding="10,4" FontSize="11.5" Margin="0,0,6,0"/>
                         <Button x:Name="BtnExportLog" Content="Exportar Log (.txt)" Style="{StaticResource ModernButton}" Padding="10,4" FontSize="11.5"/>
                     </StackPanel>
@@ -917,10 +1021,13 @@ function Show-ResultsPopup {
             </Grid>
         </Border>
 
-        <!-- BARRA DE STATUS -->
-        <DockPanel Grid.Row="3" Margin="2,6,2,0">
-            <TextBlock x:Name="LblStatus" Text="Status: Pronto (Modo Administrador)" Foreground="#9CA3AF" FontSize="11.5"/>
-            <TextBlock Text="Windows Admin Toolkit | PowerShell WPF" Foreground="#6B7280" FontSize="11.5" HorizontalAlignment="Right"/>
+        <!-- BARRA DE STATUS COM CONTROLES DO CONSOLE E POPUP -->
+        <DockPanel Grid.Row="3" Margin="2,2,2,0">
+            <TextBlock x:Name="LblStatus" Text="Status: Pronto (Modo Administrador)" Foreground="#9CA3AF" FontSize="11.5" VerticalAlignment="Center"/>
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                <Button x:Name="BtnLastResults" Content="Ver &#218;ltimos Resultados" Style="{StaticResource ModernButton}" Padding="10,4" FontSize="11.5" Margin="0,0,8,0"/>
+                <ToggleButton x:Name="BtnToggleConsole" Content="Mostrar Console (0 erros)" Background="#282C34" Foreground="#E5E7EB" BorderBrush="#3E4451" BorderThickness="1" Padding="12,4" FontSize="11.5" Cursor="Hand"/>
+            </StackPanel>
         </DockPanel>
     </Grid>
 </Window>
@@ -936,7 +1043,7 @@ $XAML.SelectNodes("//*[@*[contains(translate(name(.),'n','N'),'Name')]]") | ForE
 }
 
 # ==============================================================================
-# 7. TIMER DE ATUALIZACAO DA UI (LOG, DASHBOARD E POPUP DE RESULTADOS)
+# 7. TIMER DE ATUALIZACAO DA UI
 # ==============================================================================
 $UiTimer = New-Object System.Windows.Threading.DispatcherTimer
 $UiTimer.Interval = [TimeSpan]::FromMilliseconds(150)
@@ -952,28 +1059,46 @@ $UiTimer.Add_Tick({
     }
     $Controls.LblStatus.Text = "Status: $($SyncHash.StatusText) | Administrador: SIM"
 
-    # Atualiza Cards do Dashboard quando os dados chegam do Runspace
+    $isConsoleOpen = ($Controls.BtnToggleConsole.IsChecked -eq $true)
+    $errTxt = if ($SyncHash.ErrorCount -gt 0) { " ($($SyncHash.ErrorCount) erro(s))" } else { "" }
+    $Controls.BtnToggleConsole.Content = if ($isConsoleOpen) { "Ocultar Console$errTxt" } else { "Mostrar Console$errTxt" }
+    if ($SyncHash.ErrorCount -gt 0 -and -not $isConsoleOpen) {
+        $Controls.BtnToggleConsole.BorderBrush = "#EF4444"
+        $Controls.BtnToggleConsole.Foreground = "#FCA5A5"
+    }
+
     if ($SyncHash.DashboardReady -and $SyncHash.DashboardData) {
         $SyncHash.DashboardReady = $false
         $d = $SyncHash.DashboardData
 
+        # CPU + Temperatura
         $Controls.DashCpuPct.Text = "$($d.CpuLoad)%"
         $Controls.DashCpuBar.Value = $d.CpuLoad
-        $Controls.DashCpuSub.Text = $d.CpuCores
+        $Controls.DashCpuSub.Text = "$($d.CpuCores) | $($d.CpuName)"
+        $Controls.DashCpuTemp.Text = $d.CpuTempStr
+        if ($d.CpuTemp) {
+            $Controls.DashCpuTemp.Foreground = if ($d.CpuTemp -ge 82) { "#EF4444" } elseif ($d.CpuTemp -ge 65) { "#F59E0B" } else { "#10B981" }
+        } else {
+            $Controls.DashCpuTemp.Foreground = "#9CA3AF"
+        }
 
+        # RAM + Slots
         $Controls.DashRamPct.Text = "$($d.RamUsed) / $($d.RamTotal) GB"
         $Controls.DashRamBar.Value = $d.RamPct
-        $Controls.DashRamSub.Text = "$($d.RamPct)% em uso"
+        $Controls.DashRamSub.Text = "$($d.RamPct)% em uso ($($d.RamSlots))"
 
+        # Disco C:
         $Controls.DashDiskPct.Text = "$($d.DiskUsed) / $($d.DiskTotal) GB"
         $Controls.DashDiskBar.Value = $d.DiskPct
         $Controls.DashDiskSub.Text = "$($d.DiskFree) GB livres ($($d.DiskPct)% usado)"
 
+        # Uptime & Rede
         $Controls.DashUptime.Text = $d.Uptime
         $Controls.DashNetStatus.Text = if ($d.InternetOk) { "ONLINE (Internet OK)" } else { "OFFLINE / SEM INTERNET" }
         $Controls.DashNetStatus.Foreground = if ($d.InternetOk) { "#10B981" } else { "#F87171" }
         $Controls.DashIpMain.Text = "IP: $($d.IpAddress)"
 
+        # Ficha Tecnica
         $Controls.DashHostUser.Text = "$($d.Hostname)  |  $($d.User)"
         $Controls.DashDomain.Text   = $d.Domain
         $Controls.DashModel.Text    = $d.Model
@@ -983,7 +1108,10 @@ $UiTimer.Add_Tick({
         $Controls.DashGpu.Text      = $d.Gpu
         $Controls.DashOs.Text       = $d.OsCaption
         $Controls.DashBattery.Text  = $d.Battery
+        $Controls.DashCrash.Text    = $d.CrashSummary
+        $Controls.DashCrash.Foreground = if ($d.CrashSummary.StartsWith("0 ")) { "#10B981" } else { "#F59E0B" }
 
+        # Servicos & Seguranca
         $Controls.DashSvcSpooler.Text       = if ($d.SvcSpooler) { "ATIVO" } else { "PARADO" }
         $Controls.DashSvcSpooler.Foreground = if ($d.SvcSpooler) { "#10B981" } else { "#F87171" }
 
@@ -996,8 +1124,13 @@ $UiTimer.Add_Tick({
         $Controls.DashSvcRdp.Text       = if ($d.SvcRdp) { "ATIVADO" } else { "DESATIVADO" }
         $Controls.DashSvcRdp.Foreground = if ($d.SvcRdp) { "#3B82F6" } else { "#9CA3AF" }
 
-        $Controls.DashNetDetails.Text = "Gateway: $($d.Gateway)  |  DNS: $($d.Dns)"
+        $Controls.DashBitLocker.Text       = $d.BitLocker
+        $Controls.DashBitLocker.Foreground = if ($d.BitLocker -like "Ativo*") { "#10B981" } else { "#9CA3AF" }
+
+        # Sensores SMART, Top Processos & Rede
         $Controls.DashSmartList.Text  = $d.SmartSummary
+        $Controls.DashTopProcs.Text   = $d.TopProcs
+        $Controls.DashNetDetails.Text = "Gateway: $($d.Gateway)  |  DNS: $($d.Dns)"
     }
 
     if ($SyncHash.ShowResults) {
@@ -1008,7 +1141,22 @@ $UiTimer.Add_Tick({
 $UiTimer.Start()
 
 # ==============================================================================
-# 8. HELPER DE DIALOGOS MODAIS DE ENTRADA
+# 8. TOGGLE DO CONSOLE INFERIOR (ABRIR / FECHAR)
+# ==============================================================================
+$Controls.BtnToggleConsole.Add_Checked({
+    $Controls.ConsoleRowDef.Height = New-Object System.Windows.GridLength(175)
+    $Controls.ConsolePanel.Visibility = "Visible"
+    $Controls.BtnToggleConsole.BorderBrush = "#3B82F6"
+    $Controls.BtnToggleConsole.Foreground = "#FFFFFF"
+})
+
+$Controls.BtnToggleConsole.Add_Unchecked({
+    $Controls.ConsoleRowDef.Height = New-Object System.Windows.GridLength(0)
+    $Controls.ConsolePanel.Visibility = "Collapsed"
+})
+
+# ==============================================================================
+# 9. HELPER DE DIALOGOS MODAIS DE ENTRADA
 # ==============================================================================
 function Show-InputDialog {
     param([string]$Title, [array]$Fields)
@@ -1101,7 +1249,7 @@ function Show-InputDialog {
 }
 
 # ==============================================================================
-# 9. NAVEGACAO ENTRE ABAS E FILTRO DE PESQUISA
+# 10. NAVEGACAO ENTRE ABAS E FILTRO DE PESQUISA
 # ==============================================================================
 function Set-ActiveTab {
     param([string]$ActivePanel)
@@ -1145,10 +1293,10 @@ $Controls.TxtSearch.Add_TextChanged({
 })
 
 # ==============================================================================
-# 10. EVENTOS DO PAINEL LATERAL E CONSOLE
+# 11. EVENTOS DO PAINEL LATERAL E CONSOLE
 # ==============================================================================
 $Controls.BtnRefreshDash.Add_Click({ Update-DashboardAsync })
-$Controls.BtnClearLog.Add_Click({ $Controls.TxtConsole.Clear() })
+$Controls.BtnClearLog.Add_Click({ $Controls.TxtConsole.Clear(); $SyncHash.ErrorCount = 0 })
 
 $Controls.BtnLastResults.Add_Click({
     if ($SyncHash.ResultTabs.Count -gt 0) {
@@ -1183,7 +1331,7 @@ $Controls.BtnClearSelection.Add_Click({
 })
 
 # ==============================================================================
-# 11. EVENTOS DE BOTOES DIRETOS
+# 12. EVENTOS DE BOTOES DIRETOS
 # ==============================================================================
 
 # --- ABA 1: USUARIOS ---
@@ -1401,7 +1549,7 @@ $Controls.BtnTestPrinterNet.Add_Click({
 })
 
 # ==============================================================================
-# 12. EXECUCAO EM LOTE DAS CHECKBOXES SELECIONADAS
+# 13. EXECUCAO EM LOTE DAS CHECKBOXES SELECIONADAS
 # ==============================================================================
 $Controls.BtnRunSelected.Add_Click({
     $selectedTags = Find-VisualChildren -Parent $Controls.MainContentContainer |
@@ -1495,15 +1643,17 @@ Tempo Ligado (Uptime): $($uptime.Days) dias, $($uptime.Hours) horas, $($uptime.M
                     Add-TaskResult -TabTitle "Inventario Hardware" -Content $inv
                 }
                 "Mch_Smart" {
-                    Write-TaskLog "Consultando status SMART em Win32_DiskDrive..." "CMD"
-                    $disks = Get-CimInstance Win32_DiskDrive | ForEach-Object {
+                    Write-TaskLog "Consultando status SMART e temperatura em Get-PhysicalDisk..." "CMD"
+                    Import-Module Storage -ErrorAction SilentlyContinue
+                    $disks = Get-PhysicalDisk | ForEach-Object {
+                        $rel = $_ | Get-StorageReliabilityCounter -ErrorAction SilentlyContinue
                         $gb = [math]::Round($_.Size / 1GB, 1)
-                        "Modelo: $($_.Model)`r`nCapacidade: $gb GB | Interface: $($_.InterfaceType) | Status SMART: $($_.Status)`r`n----------------------------------------"
+                        "Disco: $($_.FriendlyName) ($gb GB | $($_.MediaType))`r`nSaude: $($_.HealthStatus) | Desgaste: $($rel.Wear)% | Temp: $($rel.Temperature)°C | Horas Ligado: $($rel.PowerOnHours)h`r`n----------------------------------------"
                     }
                     Add-TaskResult -TabTitle "Saude Discos (SMART)" -Content ($disks -join "`r`n")
                 }
                 "Mch_Battery" {
-                    Write-TaskLog "Consultando Win32_Battery..." "CMD"
+                    Write-TaskLog "Consultando Win32_Battery e capacidade real..." "CMD"
                     $bat = Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue
                     $txtBat = if ($bat) {
                         "Bateria: $($bat.Name)`r`nCarga Atual: $($bat.EstimatedChargeRemaining)%`r`nStatus: $($bat.Status)"
@@ -1557,7 +1707,7 @@ Tempo Ligado (Uptime): $($uptime.Days) dias, $($uptime.Hours) horas, $($uptime.M
 })
 
 # ==============================================================================
-# 13. INICIALIZACAO
+# 14. INICIALIZACAO
 # ==============================================================================
 Write-AppLog "IT-AdminUtil inicializado com privilegios de Administrador." "OK"
 $Window.Add_Loaded({ Update-DashboardAsync })
