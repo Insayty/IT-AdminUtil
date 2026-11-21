@@ -8,18 +8,12 @@
 #>
 
 # ==============================================================================
-# 1. AUTO-ELEVAÇÃO UAC (MÉTODO WINUTIL PARA IRM | IEX E ARQUIVO LOCAL)
+# 1. VERIFICAÇÃO DE PRIVILÉGIOS (SEM AUTO-ELEVAÇÃO PARA EVITAR BLOQUEIO AMSI)
 # ==============================================================================
-$ScriptUrl = "https://raw.githubusercontent.com/Insayty/IT-AdminUtil/main/Teste.ps1"
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-
 if (-not $isAdmin) {
-    if ($PSCommandPath -and (Test-Path $PSCommandPath)) {
-        Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"" -Verb RunAs
-    } else {
-        $cmd = "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; irm '$ScriptUrl' | iex"
-        Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -Command `"$cmd`"" -Verb RunAs
-    }
+    Write-Warning "Execute este script em um terminal PowerShell aberto como Administrador."
+    Pause
     exit
 }
 
